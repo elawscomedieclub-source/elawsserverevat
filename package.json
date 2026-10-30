@@ -1,0 +1,16 @@
+{
+  "name": "evat-quantum-signalisation",
+  "version": "3.60.0",
+  "description": "Serveur de signalisation WebRTC et WebSocket pour EVAT Quantum",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5"
+  },
+  "engines": {
+    "node": ">=18.x"
+  }
+}
