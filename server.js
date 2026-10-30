@@ -65,7 +65,7 @@ io.on('connection', (socket) => {
             const targetUser = registeredUsers.get(cleanTarget);
             if(targetUser && targetUser.socketId) {
                 io.to(targetUser.socketId).emit('p2p_signal', data);
-                console.log(`Signal P2P acheminé de ${data.sender} vers ${cleanTarget}`);
+                console.log(`Signal P2P (${data.type}) acheminé de ${data.sender} vers ${cleanTarget}`);
             } else {
                 console.log(`Échec signal P2P : destinataire ${cleanTarget} introuvable ou non connecté.`);
             }
