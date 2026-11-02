@@ -1,450 +1,708 @@
+/* ============================================================
+   EVAT Continuum — Serveur de signalisation v4.1
+   - Identité serveur-autoritaire (le client ne peut plus usurper "sender/from")
+   - PIN hashé avec scrypt + anti brute-force
+   - Présence ciblée (plus de diffusion de tous les numéros à tout le monde)
+   - Signalisation d'appel validée (occupé, manqué, hors ligne, TURN)
+   - Persistance JSON des comptes (redémarrage sans perte si disque persistant)
+   - v4.1 : notifications Web Push (appels + messages même app fermée),
+            accusés envoyé/reçu/lu, indicateur « écrit… », sonnerie rejouée à la réouverture
+   ============================================================ */
 const express = require('express');
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const crypto = require('crypto');
+
+let webpush = null;
+try { webpush = require('web-push'); } catch (e) { console.warn('⚠️ web-push absent : pas de notifications hors application (npm install).'); }
+
+const PORT = process.env.PORT || 3000;
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+const DATA_FILE = path.join(DATA_DIR, 'evat-data.json');
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '*')
+    .split(',').map(s => s.trim()).filter(Boolean);
+const corsOrigin = ALLOWED_ORIGINS.includes('*') ? '*' : ALLOWED_ORIGINS;
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+app.disable('x-powered-by');
+app.use(cors({ origin: corsOrigin }));
+app.use(express.json({ limit: '10kb' }));
 
 const server = http.createServer(app);
 const io = new Server(server, {
-    cors: {
-        origin: "*",
-        methods: ["GET", "POST"]
-    },
-    pingTimeout: 60000,
-    pingInterval: 25000
+    cors: { origin: corsOrigin, methods: ['GET', 'POST'] },
+    pingInterval: 20000,
+    pingTimeout: 30000,
+    maxHttpBufferSize: 64 * 1024,          // un SDP/ICE ne dépasse jamais ça
+    perMessageDeflate: { threshold: 1024 }, // compresse seulement les gros paquets
+    connectionStateRecovery: { maxDisconnectionDuration: 2 * 60 * 1000 }
 });
 
+/* ---------------- Données ---------------- */
 /**
- * Map téléphone → {
- *   nom, metier, socketId, lastSeen, online,
- *   recoveryPinHash, createdAt, lastDevice
- * }
- * Un numéro = UN seul compte. Récupération uniquement avec le code secret.
+ * tel → { nom, metier, pinHash, pinSalt, online, lastSeen, createdAt, socketId }
  */
 const registeredUsers = new Map();
-
 const messageHistory = [];
-const MAX_HISTORY = 200;
+const MAX_HISTORY = 300;
+const missedCalls = new Map();   // tel → [{from, at, callType}]
+const activeCalls = new Map();   // tel → { peer, callId, since }
+const failedAttempts = new Map(); // clé → { count, until }
+const pendingCalls = new Map();  // tel du destinataire → { callId, from, signals[], expires, acked }
+let vapid = null;                // { publicKey, privateKey }
 
-// Noms d'exemple interdits
+function loadData() {
+    try {
+        const raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+        (raw.users || []).forEach(u => {
+            registeredUsers.set(u.tel, {
+                nom: u.nom, metier: u.metier,
+                pinHash: u.pinHash, pinSalt: u.pinSalt,
+                createdAt: u.createdAt, lastSeen: u.lastSeen || u.createdAt,
+                push: u.push || null, online: false, hidden: false, socketId: null
+            });
+        });
+        (raw.messages || []).forEach(m => messageHistory.push(m));
+        if (raw.vapid && raw.vapid.publicKey) vapid = raw.vapid;
+        console.log(`💾 ${registeredUsers.size} comptes chargés`);
+    } catch (e) { /* premier démarrage */ }
+}
+
+let saveTimer = null;
+function saveDataSoon() {
+    if (saveTimer) return;
+    saveTimer = setTimeout(() => {
+        saveTimer = null;
+        saveDataNow();
+    }, 3000);
+}
+function saveDataNow() {
+    try {
+        const users = [];
+        for (const [tel, u] of registeredUsers) {
+            users.push({
+                tel, nom: u.nom, metier: u.metier, pinHash: u.pinHash,
+                pinSalt: u.pinSalt, createdAt: u.createdAt, lastSeen: u.lastSeen, push: u.push || null
+            });
+        }
+        const tmp = DATA_FILE + '.tmp';
+        fs.writeFileSync(tmp, JSON.stringify({ users, vapid, messages: messageHistory.slice(-MAX_HISTORY) }));
+        fs.renameSync(tmp, DATA_FILE);
+    } catch (e) {
+        console.warn('Sauvegarde impossible :', e.message);
+    }
+}
+loadData();
+
+/* ---------------- Web Push ---------------- */
+function initialiserPush() {
+    if (!webpush) return;
+    if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
+        vapid = { publicKey: process.env.VAPID_PUBLIC_KEY, privateKey: process.env.VAPID_PRIVATE_KEY };
+    } else if (!vapid) {
+        vapid = webpush.generateVAPIDKeys();   // conservées dans le fichier de données
+        console.warn('⚠️ Clés VAPID générées automatiquement. Définissez VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY pour qu\'elles survivent aux redémarrages.');
+        saveDataSoon();
+    }
+    webpush.setVapidDetails(process.env.VAPID_SUBJECT || 'mailto:contact@evat.app', vapid.publicKey, vapid.privateKey);
+}
+
+async function envoyerPush(tel, payload) {
+    const u = registeredUsers.get(tel);
+    if (!webpush || !vapid || !u || !u.push) return false;
+    try {
+        await webpush.sendNotification(u.push, JSON.stringify(payload), {
+            TTL: payload.type === 'call' ? 30 : 3600,
+            urgency: 'high'
+        });
+        return true;
+    } catch (e) {
+        if (e && (e.statusCode === 404 || e.statusCode === 410)) { u.push = null; saveDataSoon(); }
+        return false;
+    }
+}
+
+// Joignable en direct = connecté ET page visible (sinon on double avec une notification push)
+const joignableDirect = u => !!(u && u.online && !u.hidden);
+
+/* ---------------- Utilitaires ---------------- */
 const NOMS_INTERDITS = [
-    'kodjo marceline',
-    'kodjo',
-    'marceline',
-    'test',
-    'admin',
-    'utilisateur',
-    'user',
-    'exemple',
-    'demo',
-    'opérateur',
-    'operateur'
+    'kodjo marceline', 'kodjo', 'marceline', 'test', 'admin',
+    'utilisateur', 'user', 'exemple', 'demo', 'operateur'
 ];
 
-function nettoyerTel(tel) {
-    if (!tel) return '';
-    return String(tel).replace(/[\s\-\.\(\)]/g, '').trim();
-}
-
-function hashPin(pin) {
-    return crypto.createHash('sha256').update(String(pin).trim()).digest('hex');
-}
-
-function genererPin() {
-    // Code à 6 chiffres, facile à noter, difficile à deviner
-    return String(Math.floor(100000 + Math.random() * 900000));
-}
+const nettoyerTel = tel => tel ? String(tel).replace(/[\s\-.()]/g, '').trim() : '';
+const telEstValide = tel => /^\+[1-9]\d{8,14}$/.test(nettoyerTel(tel));
 
 function nomEstValide(nom) {
     if (!nom || typeof nom !== 'string') return false;
     const n = nom.trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-    if (n.length < 3) return false;
-    if (NOMS_INTERDITS.some(interdit => n === interdit || n.includes(interdit))) return false;
-    // Au moins une lettre
-    if (!/[a-zàâäéèêëïîôùûüç]/i.test(nom)) return false;
-    return true;
+    if (n.length < 3 || n.length > 80) return false;
+    if (NOMS_INTERDITS.some(x => n === x || n.includes(x))) return false;
+    return /[a-z]/i.test(n);
 }
 
-function telEstValide(tel) {
-    const t = nettoyerTel(tel);
-    // Doit commencer par + et avoir entre 10 et 16 caractères au total
-    if (!/^\+[1-9]\d{8,14}$/.test(t)) return false;
-    return true;
+function genererPin() {
+    return String(crypto.randomInt(100000, 1000000));
 }
 
-function getOnlineUsers() {
-    const list = [];
-    for (const [tel, u] of registeredUsers.entries()) {
-        if (u.online) {
-            list.push({
-                telephone: tel,
-                nom: u.nom,
-                metier: u.metier,
-                lastSeen: u.lastSeen
+function hashPin(pin, saltHex) {
+    const salt = saltHex ? Buffer.from(saltHex, 'hex') : crypto.randomBytes(16);
+    const hash = crypto.scryptSync(String(pin).trim(), salt, 32);
+    return { pinHash: hash.toString('hex'), pinSalt: salt.toString('hex') };
+}
+
+function pinEstCorrect(user, pin) {
+    if (!user || !user.pinHash || !user.pinSalt || !pin) return false;
+    const { pinHash } = hashPin(pin, user.pinSalt);
+    const a = Buffer.from(pinHash, 'hex');
+    const b = Buffer.from(user.pinHash, 'hex');
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+// Anti brute-force : 5 erreurs → blocage 15 min PAR NUMÉRO.
+// L'IP n'a qu'un seuil très large (30) : sur les réseaux mobiles (CGNAT) beaucoup d'utilisateurs partagent la même IP.
+function ipDe(socket) {
+    const h = socket.handshake;
+    const fwd = h.headers['x-forwarded-for'];
+    return (fwd ? String(fwd).split(',')[0].trim() : h.address) || 'ip?';
+}
+function estBloque(cle) {
+    const f = failedAttempts.get(cle);
+    return !!(f && f.until && f.until > Date.now());
+}
+function noterEchec(cle, seuil = 5) {
+    const f = failedAttempts.get(cle) || { count: 0, until: 0 };
+    f.count += 1;
+    if (f.count >= seuil) { f.until = Date.now() + 15 * 60 * 1000; f.count = 0; }
+    failedAttempts.set(cle, f);
+}
+function effacerEchecs(cle) { failedAttempts.delete(cle); }
+setInterval(() => {
+    const now = Date.now();
+    for (const [k, f] of failedAttempts) if (f.until && f.until < now) failedAttempts.delete(k);
+}, 10 * 60 * 1000).unref();
+
+// Limiteur simple (jetons) par socket
+function limiteur(socket, nom, max, fenetreMs) {
+    const now = Date.now();
+    socket._rl = socket._rl || {};
+    const b = socket._rl[nom] || (socket._rl[nom] = { n: 0, t: now });
+    if (now - b.t > fenetreMs) { b.n = 0; b.t = now; }
+    b.n += 1;
+    return b.n <= max;
+}
+
+const ack = (cb, payload) => { if (typeof cb === 'function') cb(payload); };
+let _initPushFait = false;
+
+/* ---------------- Présence ciblée ---------------- */
+const roomUser = tel => `u:${tel}`;
+const roomWatch = tel => `watch:${tel}`;
+
+function infoPublique(tel, u) {
+    return { telephone: tel, nom: u.nom, metier: u.metier, online: !!u.online, lastSeen: u.lastSeen };
+}
+
+function compterEnLigne() {
+    let n = 0;
+    for (const u of registeredUsers.values()) if (u.online) n++;
+    return n;
+}
+
+function emettrePresence(tel) {
+    const u = registeredUsers.get(tel);
+    if (!u) return;
+    io.to(roomWatch(tel)).emit('presence', infoPublique(tel, u));
+    planifierCompteur();
+}
+
+let compteurTimer = null;
+let dernierCompteur = -1;
+function planifierCompteur() {
+    if (compteurTimer) return;
+    compteurTimer = setTimeout(() => {
+        compteurTimer = null;
+        const n = compterEnLigne();
+        if (n !== dernierCompteur) {
+            dernierCompteur = n;
+            io.emit('online_count', n);
+        }
+    }, 2000);
+}
+
+function lierSocket(socket, tel, user) {
+    // Éjecte l'ancien appareil (1 compte = 1 appareil actif)
+    if (user.socketId && user.socketId !== socket.id) {
+        const old = io.sockets.sockets.get(user.socketId);
+        if (old) {
+            old.emit('force_logout', {
+                reason: 'session_taken',
+                message: 'Votre compte a été ouvert sur un autre appareil. Vous avez été déconnecté automatiquement.'
             });
+            old.leave(roomUser(tel));
+            old.telephone = null;
         }
     }
-    return list;
+    user.socketId = socket.id;
+    user.online = true;
+    user.hidden = false;
+    user.lastSeen = Date.now();
+    socket.telephone = tel;
+    socket.join(roomUser(tel));
+    emettrePresence(tel);
+
+    // Un appel est en train de sonner pour cet utilisateur (il vient d'ouvrir l'app via la notification) : on le lui rejoue
+    const pend = pendingCalls.get(tel);
+    const enCours = activeCalls.get(tel);
+    if (pend && !pend.acked && pend.expires > Date.now() && enCours && enCours.callId === pend.callId) {
+        pend.signals.forEach(sig => socket.emit('p2p_signal', sig));
+    }
+
+    // Appels manqués pendant l'absence
+    const manques = missedCalls.get(tel);
+    if (manques && manques.length) {
+        socket.emit('missed_calls', manques);
+        missedCalls.delete(tel);
+    }
 }
 
-io.on('connection', (socket) => {
-    console.log(`[+] Connexion : ${socket.id}`);
+/* ---------------- TURN / ICE ---------------- */
+function construireIce() {
+    const servers = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
+    const urls = (process.env.TURN_URLS || '').split(',').map(s => s.trim()).filter(Boolean);
+    if (urls.length) {
+        if (process.env.TURN_SECRET) {
+            // Identifiants temporaires (coturn "use-auth-secret")
+            const expiry = Math.floor(Date.now() / 1000) + 6 * 3600;
+            const username = `${expiry}:evat`;
+            const credential = crypto.createHmac('sha1', process.env.TURN_SECRET).update(username).digest('base64');
+            servers.push({ urls, username, credential });
+        } else if (process.env.TURN_USERNAME && process.env.TURN_CREDENTIAL) {
+            servers.push({ urls, username: process.env.TURN_USERNAME, credential: process.env.TURN_CREDENTIAL });
+        }
+    }
+    return servers;
+}
 
-    // Vérifier si un numéro est déjà pris (sans révéler le nom complet)
-    socket.on('check_phone', (data, callback) => {
-        const cleanTel = nettoyerTel(data && data.telephone);
-        if (!telEstValide(cleanTel)) {
-            if (typeof callback === 'function') {
-                callback({ ok: false, error: 'Numéro invalide. Format attendu : +228XXXXXXXX' });
-            }
-            return;
-        }
-        const exists = registeredUsers.has(cleanTel);
-        if (typeof callback === 'function') {
-            callback({
-                ok: true,
-                exists,
-                // On ne révèle PAS le nom : juste si le compte existe
-                message: exists
-                    ? 'Ce numéro est déjà enregistré. Entrez votre code de récupération pour récupérer le compte.'
-                    : 'Numéro disponible. Vous pouvez créer un nouveau compte.'
-            });
-        }
+/* ---------------- Socket.io ---------------- */
+const TYPES_SIGNAL = new Set(['offer', 'answer', 'ice_candidate', 'hangup', 'reject', 'busy', 'ringing']);
+
+io.on('connection', (socket) => {
+    socket.on('check_phone', (data, cb) => {
+        if (!limiteur(socket, 'check', 10, 60000)) return ack(cb, { ok: false, error: 'Trop de requêtes.' });
+        const tel = nettoyerTel(data && data.telephone);
+        if (!telEstValide(tel)) return ack(cb, { ok: false, error: 'Numéro invalide. Format attendu : +228XXXXXXXX' });
+        const exists = registeredUsers.has(tel);
+        ack(cb, {
+            ok: true, exists,
+            message: exists
+                ? 'Ce numéro est déjà enregistré. Entrez votre code de récupération.'
+                : 'Numéro disponible.'
+        });
     });
 
-    /**
-     * Création d'un NOUVEAU compte
-     * data: { nom, telephone, metier }
-     * → génère un recoveryPin unique, renvoyé UNE SEULE FOIS
-     */
-    socket.on('register_new', (data, callback) => {
-        if (!data || !data.telephone || !data.nom) {
-            if (typeof callback === 'function') callback({ ok: false, error: 'Nom et téléphone obligatoires.' });
-            return;
-        }
+    socket.on('register_new', (data, cb) => {
+        if (!limiteur(socket, 'register', 5, 60000)) return ack(cb, { ok: false, error: 'Trop de tentatives. Patientez.' });
+        if (!data || !data.telephone || !data.nom) return ack(cb, { ok: false, error: 'Nom et téléphone obligatoires.' });
 
-        const cleanTel = nettoyerTel(data.telephone);
-        const nom = String(data.nom).trim();
+        const tel = nettoyerTel(data.telephone);
+        const nom = String(data.nom).trim().slice(0, 80);
         const metier = String(data.metier || 'Opérateur').trim().slice(0, 80);
 
-        if (!telEstValide(cleanTel)) {
-            if (typeof callback === 'function') callback({ ok: false, error: 'Numéro invalide. Exemple : +22890123456' });
-            return;
-        }
+        if (!telEstValide(tel)) return ack(cb, { ok: false, error: 'Numéro invalide. Exemple : +22890123456' });
         if (!nomEstValide(nom)) {
-            if (typeof callback === 'function') {
-                callback({
-                    ok: false,
-                    error: 'Nom invalide ou réservé (exemples / tests interdits). Entrez VOTRE vrai nom et prénom.'
-                });
-            }
-            return;
+            return ack(cb, { ok: false, error: 'Nom invalide ou réservé (exemples / tests interdits). Entrez VOTRE vrai nom et prénom.' });
         }
-
-        if (registeredUsers.has(cleanTel)) {
-            if (typeof callback === 'function') {
-                callback({
-                    ok: false,
-                    error: 'Ce numéro est déjà lié à un compte. Utilisez « Récupérer mon compte » avec votre code secret.',
-                    needsRecovery: true
-                });
-            }
-            return;
+        if (registeredUsers.has(tel)) {
+            return ack(cb, {
+                ok: false, needsRecovery: true,
+                error: 'Ce numéro est déjà lié à un compte. Utilisez « Récupérer mon compte » avec votre code secret.'
+            });
         }
 
         const pin = genererPin();
-        const pinHash = hashPin(pin);
+        const { pinHash, pinSalt } = hashPin(pin);
+        const user = {
+            nom, metier, pinHash, pinSalt,
+            online: false, hidden: false, push: null, lastSeen: Date.now(), createdAt: Date.now(), socketId: null
+        };
+        registeredUsers.set(tel, user);
+        lierSocket(socket, tel, user);
+        saveDataSoon();
+        console.log(`[NEW] ${nom} (${tel})`);
 
-        registeredUsers.set(cleanTel, {
-            nom,
-            metier,
-            socketId: socket.id,
-            online: true,
-            lastSeen: Date.now(),
-            recoveryPinHash: pinHash,
-            createdAt: Date.now(),
-            lastDevice: socket.id
+        // Seuls ceux qui ont ce numéro en contact sont prévenus
+        io.to(roomWatch(tel)).emit('contact_registered', { nom, telephone: tel, metier });
+
+        ack(cb, {
+            ok: true, recoveryPin: pin,
+            message: 'Compte créé. Notez bien votre code de récupération : vous en aurez besoin si vous changez de téléphone.'
         });
-
-        socket.telephone = cleanTel;
-        console.log(`[NEW] Compte créé : ${nom} (${cleanTel})`);
-
-        socket.broadcast.emit('contact_registered', {
-            nom,
-            telephone: cleanTel,
-            metier
-        });
-        io.emit('presence_update', getOnlineUsers());
-
-        if (typeof callback === 'function') {
-            callback({
-                ok: true,
-                recoveryPin: pin, // UNIQUEMENT à la création — à noter obligatoirement
-                message: 'Compte créé. Notez bien votre code de récupération : vous en aurez besoin si vous changez de téléphone.'
-            });
-        }
     });
 
-    /**
-     * Récupération d'un compte existant (changement de téléphone / nouvel appareil)
-     * data: { telephone, recoveryPin, nom? }
-     * Le PIN prouve que c'est bien le propriétaire.
-     */
-    socket.on('recover_account', (data, callback) => {
-        if (!data || !data.telephone || !data.recoveryPin) {
-            if (typeof callback === 'function') callback({ ok: false, error: 'Numéro et code de récupération obligatoires.' });
-            return;
+    socket.on('recover_account', (data, cb) => {
+        if (!data || !data.telephone || !data.recoveryPin) return ack(cb, { ok: false, error: 'Numéro et code de récupération obligatoires.' });
+        const tel = nettoyerTel(data.telephone);
+        const cleIp = 'ip:' + ipDe(socket);
+        const cleTel = 'tel:' + tel;
+        if (estBloque(cleIp) || estBloque(cleTel)) {
+            return ack(cb, { ok: false, error: 'Trop d’essais. Réessayez dans 15 minutes.' });
         }
 
-        const cleanTel = nettoyerTel(data.telephone);
-        const pin = String(data.recoveryPin).trim();
-
-        if (!registeredUsers.has(cleanTel)) {
-            if (typeof callback === 'function') callback({ ok: false, error: 'Aucun compte trouvé pour ce numéro.' });
-            return;
+        const user = registeredUsers.get(tel);
+        if (!user) { noterEchec(cleIp, 30); return ack(cb, { ok: false, error: 'Aucun compte trouvé pour ce numéro.' }); }
+        if (!pinEstCorrect(user, data.recoveryPin)) {
+            noterEchec(cleIp, 30); noterEchec(cleTel, 5);
+            return ack(cb, { ok: false, error: 'Code de récupération incorrect.' });
         }
+        effacerEchecs(cleTel);
 
-        const user = registeredUsers.get(cleanTel);
-        if (user.recoveryPinHash !== hashPin(pin)) {
-            console.log(`[RECOVER FAIL] Mauvais PIN pour ${cleanTel}`);
-            if (typeof callback === 'function') callback({ ok: false, error: 'Code de récupération incorrect.' });
-            return;
-        }
-
-        // Déconnecter l'ANCIEN appareil automatiquement
-        const oldSocketId = user.socketId;
-        if (oldSocketId && oldSocketId !== socket.id) {
-            const oldSocket = io.sockets.sockets.get(oldSocketId);
-            if (oldSocket) {
-                oldSocket.emit('force_logout', {
-                    reason: 'session_taken',
-                    message: 'Votre compte a été ouvert sur un autre appareil. Vous avez été déconnecté automatiquement.'
-                });
-                oldSocket.telephone = null;
-                console.log(`[FORCE LOGOUT] Ancien appareil ${oldSocketId} déconnecté pour ${cleanTel}`);
-            }
-        }
-
-        // Nouveau code d'activation : l'ancien PIN devient invalide
         const nouveauPin = genererPin();
-        user.recoveryPinHash = hashPin(nouveauPin);
-        user.socketId = socket.id;
-        user.online = true;
-        user.lastSeen = Date.now();
-        user.lastDevice = socket.id;
-        if (data.metier && String(data.metier).trim()) {
-            user.metier = String(data.metier).trim().slice(0, 80);
-        }
-        registeredUsers.set(cleanTel, user);
-        socket.telephone = cleanTel;
+        Object.assign(user, hashPin(nouveauPin));
+        if (data.metier && String(data.metier).trim()) user.metier = String(data.metier).trim().slice(0, 80);
+        lierSocket(socket, tel, user);
+        saveDataSoon();
+        console.log(`[RECOVER OK] ${user.nom} (${tel})`);
 
-        console.log(`[RECOVER OK] ${user.nom} (${cleanTel}) → nouvel appareil ${socket.id} + nouveau PIN`);
-
-        io.emit('presence_update', getOnlineUsers());
-
-        if (typeof callback === 'function') {
-            callback({
-                ok: true,
-                recoveryPin: nouveauPin,
-                profil: {
-                    nom: user.nom,
-                    telephone: cleanTel,
-                    metier: user.metier
-                },
-                message: 'Compte récupéré. Ancien appareil déconnecté. Notez votre NOUVEAU code de récupération.'
-            });
-        }
+        ack(cb, {
+            ok: true, recoveryPin: nouveauPin,
+            profil: { nom: user.nom, telephone: tel, metier: user.metier },
+            message: 'Compte récupéré. Ancien appareil déconnecté. Notez votre NOUVEAU code de récupération.'
+        });
     });
 
-    /**
-     * Connexion d'une session déjà connue localement (localStorage)
-     * data: { telephone, recoveryPin } — on vérifie le PIN pour éviter l'usurpation
-     */
-    socket.on('register_user', (data, callback) => {
-        if (!data || !data.telephone) {
-            if (typeof callback === 'function') callback && callback({ ok: false, error: 'Téléphone manquant.' });
-            return;
-        }
+    socket.on('register_user', (data, cb) => {
+        if (!data || !data.telephone) return ack(cb, { ok: false, error: 'Téléphone manquant.' });
+        const tel = nettoyerTel(data.telephone);
+        const cleTel = 'tel:' + tel;
+        if (estBloque(cleTel)) return ack(cb, { ok: false, error: 'Trop d’essais. Réessayez plus tard.' });
 
-        const cleanTel = nettoyerTel(data.telephone);
-        const existing = registeredUsers.get(cleanTel);
-
-        // Si le compte existe côté serveur, on exige le PIN
+        const existing = registeredUsers.get(tel);
         if (existing) {
-            if (data.recoveryPin && existing.recoveryPinHash === hashPin(data.recoveryPin)) {
-                // Déconnecter l'ancien appareil si c'est un autre socket
-                const oldSocketId = existing.socketId;
-                if (oldSocketId && oldSocketId !== socket.id) {
-                    const oldSocket = io.sockets.sockets.get(oldSocketId);
-                    if (oldSocket) {
-                        oldSocket.emit('force_logout', {
-                            reason: 'session_taken',
-                            message: 'Votre compte a été ouvert sur un autre appareil. Vous avez été déconnecté automatiquement.'
-                        });
-                        oldSocket.telephone = null;
-                        console.log(`[FORCE LOGOUT] Ancien appareil ${oldSocketId} déconnecté pour ${cleanTel}`);
-                    }
-                }
-                existing.socketId = socket.id;
-                existing.online = true;
-                existing.lastSeen = Date.now();
-                existing.lastDevice = socket.id;
-                registeredUsers.set(cleanTel, existing);
-                socket.telephone = cleanTel;
-                io.emit('presence_update', getOnlineUsers());
-                if (typeof callback === 'function') callback({ ok: true });
-                return;
+            if (pinEstCorrect(existing, data.recoveryPin)) {
+                effacerEchecs(cleTel);
+                if (data.metier && String(data.metier).trim()) existing.metier = String(data.metier).trim().slice(0, 80);
+                if (nomEstValide(data.nom)) existing.nom = String(data.nom).trim().slice(0, 80);
+                lierSocket(socket, tel, existing);
+                saveDataSoon();
+                return ack(cb, { ok: true });
             }
-            // Sans PIN valide : on ne prend PAS le contrôle du compte
-            if (typeof callback === 'function') {
-                callback({
-                    ok: false,
-                    error: 'Ce numéro appartient déjà à un compte. Utilisez le code de récupération.',
-                    needsRecovery: true
-                });
-            }
-            return;
+            noterEchec(cleTel);
+            return ack(cb, { ok: false, needsRecovery: true, error: 'Ce numéro appartient déjà à un compte. Utilisez le code de récupération.' });
         }
 
-        // Compte pas encore côté serveur (redémarrage serveur) mais client a un profil local
-        // On recrée le compte UNIQUEMENT si un PIN est fourni (sinon on refuse pour éviter le vol)
-        if (data.recoveryPin && nomEstValide(data.nom) && telEstValide(cleanTel)) {
-            registeredUsers.set(cleanTel, {
-                nom: String(data.nom).trim(),
-                metier: String(data.metier || 'Opérateur').trim(),
-                socketId: socket.id,
-                online: true,
-                lastSeen: Date.now(),
-                recoveryPinHash: hashPin(data.recoveryPin),
-                createdAt: Date.now(),
-                lastDevice: socket.id
-            });
-            socket.telephone = cleanTel;
-            io.emit('presence_update', getOnlineUsers());
-            if (typeof callback === 'function') callback({ ok: true, restored: true });
-            return;
+        // Serveur redémarré sans disque persistant : on recrée le compte depuis le client (PIN obligatoire)
+        if (data.recoveryPin && /^\d{6}$/.test(String(data.recoveryPin).trim()) && nomEstValide(data.nom) && telEstValide(tel)) {
+            const user = {
+                nom: String(data.nom).trim().slice(0, 80),
+                metier: String(data.metier || 'Opérateur').trim().slice(0, 80),
+                ...hashPin(data.recoveryPin),
+                online: false, hidden: false, push: null, lastSeen: Date.now(), createdAt: Date.now(), socketId: null
+            };
+            registeredUsers.set(tel, user);
+            lierSocket(socket, tel, user);
+            saveDataSoon();
+            return ack(cb, { ok: true, restored: true });
         }
-
-        if (typeof callback === 'function') {
-            callback({ ok: false, error: 'Impossible de lier ce numéro sans code de récupération.' });
-        }
+        ack(cb, { ok: false, error: 'Impossible de lier ce numéro sans code de récupération.' });
     });
 
-    // Demande de contacts
-    socket.on('query_contacts', (telephones, callback) => {
+    // Contacts + abonnement à leur présence (uniquement eux, pas tout le monde)
+    socket.on('query_contacts', (telephones, cb) => {
+        if (!socket.telephone) return ack(cb, []);
+        if (!limiteur(socket, 'query', 20, 60000)) return ack(cb, []);
         const resultats = [];
         if (Array.isArray(telephones)) {
-            telephones.forEach(tel => {
-                const cleanTel = nettoyerTel(tel);
-                if (registeredUsers.has(cleanTel)) {
-                    const usr = registeredUsers.get(cleanTel);
-                    resultats.push({
-                        telephone: cleanTel,
-                        metier: usr.metier,
-                        nom: usr.nom,
-                        online: !!usr.online,
-                        lastSeen: usr.lastSeen
-                    });
-                }
+            // on se désabonne des anciens, on s'abonne aux nouveaux
+            (socket._watched || []).forEach(t => socket.leave(roomWatch(t)));
+            socket._watched = [];
+            telephones.slice(0, 500).forEach(t => {
+                const tel = nettoyerTel(t);
+                const u = registeredUsers.get(tel);
+                if (!u) return;
+                socket.join(roomWatch(tel));
+                socket._watched.push(tel);
+                resultats.push(infoPublique(tel, u));
             });
         }
-        if (typeof callback === 'function') callback(resultats);
+        ack(cb, resultats);
+        socket.emit('online_count', compterEnLigne());
     });
 
-    // Signalisation WebRTC
+    socket.on('get_ice', (_, cb) => {
+        if (!socket.telephone) return ack(cb, { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+        ack(cb, { iceServers: construireIce() });
+    });
+
+    /* ----- Signalisation d'appel ----- */
     socket.on('p2p_signal', (data) => {
-        if (!data || !data.target) return;
-        const cleanTarget = nettoyerTel(data.target);
-        const targetUser = registeredUsers.get(cleanTarget);
+        if (!socket.telephone || !data || typeof data !== 'object') return;
+        if (!TYPES_SIGNAL.has(data.type)) return;
+        if (!limiteur(socket, 'signal', 200, 10000)) return;
 
-        if (targetUser && targetUser.socketId && targetUser.online) {
-            io.to(targetUser.socketId).emit('p2p_signal', data);
-        } else {
-            socket.emit('p2p_signal', {
-                type: 'user_offline',
-                target: cleanTarget,
-                sender: data.sender
-            });
-        }
-    });
-
-    // Messagerie
-    socket.on('send_message', (payload) => {
-        if (!payload || !payload.texte) return;
+        const from = socket.telephone;
+        const to = nettoyerTel(data.target);
+        const cible = registeredUsers.get(to);
+        if (!cible || to === from) return;
 
         const msg = {
-            id: Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
-            from: payload.from || socket.telephone,
-            fromName: payload.fromName || 'Inconnu',
-            to: payload.to || null,
-            texte: String(payload.texte).slice(0, 1000),
-            heure: new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }),
-            timestamp: Date.now()
+            type: data.type,
+            sender: from,                       // imposé par le serveur
+            senderName: registeredUsers.get(from).nom,
+            callId: String(data.callId || '').slice(0, 40),
+            callType: data.callType === 'video' ? 'video' : 'audio',
+            renegotiate: !!data.renegotiate
+        };
+        if (data.offer) msg.offer = data.offer;
+        if (data.answer) msg.answer = data.answer;
+        if (data.candidate) msg.candidate = data.candidate;
+
+        // ----- Nouvelle sonnerie -----
+        if (data.type === 'offer' && !data.renegotiate) {
+            if (!cible.online && !cible.push) {
+                socket.emit('p2p_signal', { type: 'user_offline', sender: to, callId: msg.callId });
+                const l = missedCalls.get(to) || [];
+                l.push({ from, fromName: msg.senderName, at: Date.now(), callType: msg.callType });
+                missedCalls.set(to, l.slice(-20));
+                return;
+            }
+            if (activeCalls.has(to) || activeCalls.has(from)) {
+                socket.emit('p2p_signal', { type: 'busy', sender: to, callId: msg.callId });
+                return;
+            }
+            activeCalls.set(from, { peer: to, callId: msg.callId, since: Date.now() });
+            activeCalls.set(to, { peer: from, callId: msg.callId, since: Date.now() });
+            pendingCalls.set(to, { callId: msg.callId, from, fromName: msg.senderName, callType: msg.callType,
+                                   signals: [msg], expires: Date.now() + 35000, acked: false });
+            if (!joignableDirect(cible)) {
+                // téléphone verrouillé / app fermée → notification qui fait « sonner » l'appareil
+                envoyerPush(to, {
+                    type: 'call', callId: msg.callId, from, fromName: msg.senderName, callType: msg.callType,
+                    title: msg.callType === 'video' ? '📹 Appel vidéo EVAT' : '📞 Appel EVAT',
+                    body: msg.senderName + ' vous appelle', tag: 'evat-call'
+                });
+            }
+        } else {
+            // candidats ICE : mis de côté tant que le destinataire n'a pas reçu l'offre
+            const pend = pendingCalls.get(to);
+            if (pend && pend.callId === msg.callId && !pend.acked && data.type === 'ice_candidate' && pend.signals.length < 60) {
+                pend.signals.push(msg);
+            }
+        }
+
+        if (data.type === 'ringing') {
+            const p = pendingCalls.get(from);
+            if (p && p.callId === msg.callId) p.acked = true;   // le destinataire a bien reçu l'appel
+        }
+
+        if (data.type === 'answer' || data.type === 'reject' || data.type === 'hangup' || data.type === 'busy') {
+            // Appel jamais décroché ni reçu → appel manqué (notification push)
+            const p = pendingCalls.get(to);
+            if (data.type === 'hangup' && p && p.callId === msg.callId && !p.acked) {
+                const l = missedCalls.get(to) || [];
+                l.push({ from, fromName: msg.senderName, at: Date.now(), callType: msg.callType });
+                missedCalls.set(to, l.slice(-20));
+                if (!joignableDirect(cible)) {
+                    envoyerPush(to, { type: 'missed', title: '📵 Appel manqué', body: msg.senderName + ' a essayé de vous joindre', tag: 'evat-missed', from });
+                }
+            }
+            pendingCalls.delete(to); pendingCalls.delete(from);
+        }
+        if (data.type === 'hangup' || data.type === 'reject' || data.type === 'busy') {
+            const c = activeCalls.get(from);
+            if (c && c.peer === to) { activeCalls.delete(from); activeCalls.delete(to); }
+        }
+
+        if (cible.online) io.to(roomUser(to)).emit('p2p_signal', msg);
+        else if (!pendingCalls.has(to) && data.type !== 'hangup' && data.type !== 'reject') {
+            socket.emit('p2p_signal', { type: 'user_offline', sender: to, callId: msg.callId });
+        }
+    });
+
+    /* ----- Notifications push & visibilité ----- */
+    socket.on('get_vapid', (_, cb) => ack(cb, { publicKey: (webpush && vapid) ? vapid.publicKey : null }));
+
+    socket.on('push_subscribe', (sub, cb) => {
+        const u = socket.telephone && registeredUsers.get(socket.telephone);
+        if (!u || !sub || typeof sub.endpoint !== 'string' || !sub.keys || !sub.keys.p256dh || !sub.keys.auth) return ack(cb, { ok: false });
+        if (!/^https:\/\//.test(sub.endpoint) || sub.endpoint.length > 600) return ack(cb, { ok: false });
+        u.push = { endpoint: sub.endpoint, keys: { p256dh: String(sub.keys.p256dh), auth: String(sub.keys.auth) } };
+        saveDataSoon();
+        ack(cb, { ok: true });
+    });
+
+    socket.on('push_unsubscribe', (_, cb) => {
+        const u = socket.telephone && registeredUsers.get(socket.telephone);
+        if (u) { u.push = null; saveDataSoon(); }
+        ack(cb, { ok: true });
+    });
+
+    socket.on('visibility', (hidden) => {
+        const u = socket.telephone && registeredUsers.get(socket.telephone);
+        if (u) u.hidden = !!hidden;
+    });
+
+    /* ----- Messagerie ----- */
+    socket.on('send_message', (payload, cb) => {
+        if (!socket.telephone || !payload || typeof payload.texte !== 'string') return ack(cb, { ok: false });
+        if (!limiteur(socket, 'msg', 20, 10000)) return ack(cb, { ok: false, error: 'Doucement, trop de messages.' });
+        const texte = payload.texte.trim().slice(0, 1000);
+        if (!texte) return ack(cb, { ok: false });
+
+        const me = registeredUsers.get(socket.telephone);
+        const to = payload.to ? nettoyerTel(payload.to) : null;
+        const dest = to ? registeredUsers.get(to) : null;
+        if (to && !dest) return ack(cb, { ok: false, error: 'Ce numéro n’a pas de compte EVAT.' });
+
+        const msg = {
+            id: Date.now().toString(36) + crypto.randomBytes(3).toString('hex'),
+            from: socket.telephone,             // imposé par le serveur
+            fromName: me.nom,
+            to,
+            texte,
+            heure: new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Africa/Lome' }),
+            timestamp: Date.now(),
+            cid: String(payload.cid || '').slice(0, 40),
+            delivered: false, read: false
         };
 
-        messageHistory.push(msg);
-        if (messageHistory.length > MAX_HISTORY) messageHistory.shift();
-
-        if (msg.to) {
-            const target = registeredUsers.get(nettoyerTel(msg.to));
-            if (target && target.socketId) {
-                io.to(target.socketId).emit('new_message', msg);
+        if (to) {
+            if (dest.online) { msg.delivered = true; }
+            messageHistory.push(msg);
+            io.to(roomUser(to)).emit('new_message', msg);
+            io.to(roomUser(socket.telephone)).emit('new_message', msg);
+            if (!joignableDirect(dest)) {
+                envoyerPush(to, {
+                    type: 'message', title: me.nom, body: texte.length > 140 ? texte.slice(0, 137) + '…' : texte,
+                    from: socket.telephone, tag: 'msg-' + socket.telephone
+                });
             }
-            socket.emit('new_message', msg);
         } else {
+            messageHistory.push(msg);
             io.emit('new_message', msg);
         }
+        if (messageHistory.length > MAX_HISTORY) messageHistory.shift();
+        saveDataSoon();
+        ack(cb, { ok: true, id: msg.id, delivered: msg.delivered });
     });
 
-    socket.on('get_history', (limit, callback) => {
-        const n = Math.min(parseInt(limit) || 50, 100);
-        const recent = messageHistory.slice(-n);
-        if (typeof callback === 'function') callback(recent);
-    });
-
-    socket.on('signal', (data) => {
-        if (data && data.type === 'location') {
-            socket.broadcast.emit('signal', { ...data, senderTel: socket.telephone });
-        } else {
-            socket.broadcast.emit('signal', data);
+    // « J'ai lu la conversation avec X » → coche bleue chez X
+    socket.on('mark_read', (data) => {
+        if (!socket.telephone || !data) return;
+        const peer = nettoyerTel(data.peer);
+        const me = socket.telephone;
+        const ids = [];
+        for (let i = messageHistory.length - 1, n = 0; i >= 0 && n < 300; i--, n++) {
+            const m = messageHistory[i];
+            if (m.from === peer && m.to === me && !m.read) { m.read = true; m.delivered = true; ids.push(m.id); }
         }
+        if (ids.length) {
+            io.to(roomUser(peer)).emit('msg_status', { ids, status: 'read', by: me });
+            saveDataSoon();
+        }
+    });
+
+    socket.on('typing', (data) => {
+        if (!socket.telephone || !data || !data.to) return;
+        if (!limiteur(socket, 'typing', 40, 10000)) return;
+        io.to(roomUser(nettoyerTel(data.to))).emit('typing', { from: socket.telephone, on: !!data.on });
+    });
+
+    // Historique : diffusions + MES conversations privées seulement
+    socket.on('get_history', (limit, cb) => {
+        if (!socket.telephone) return ack(cb, []);
+        const n = Math.min(parseInt(limit, 10) || 50, 150);
+        const me = socket.telephone;
+        const out = [];
+        const livres = {};
+        for (let i = messageHistory.length - 1; i >= 0 && out.length < n; i--) {
+            const m = messageHistory[i];
+            if (!m.to || m.to === me || m.from === me) {
+                out.push(m);
+                if (m.to === me && !m.delivered) { m.delivered = true; (livres[m.from] = livres[m.from] || []).push(m.id); }
+            }
+        }
+        // les expéditeurs voient « reçu » dès que le destinataire récupère ses messages
+        Object.keys(livres).forEach(tel => io.to(roomUser(tel)).emit('msg_status', { ids: livres[tel], status: 'delivered', by: me }));
+        ack(cb, out.reverse());
+    });
+
+    // Position GPS : uniquement pour ceux qui m'ont en contact
+    socket.on('signal', (data) => {
+        if (!socket.telephone || !data || data.type !== 'location') return;
+        if (!limiteur(socket, 'loc', 10, 60000)) return;
+        const lat = Number(data.lat), lng = Number(data.lng);
+        if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+        const me = registeredUsers.get(socket.telephone);
+        socket.to(roomWatch(socket.telephone)).emit('signal', {
+            type: 'location', lat, lng, sender: me.nom, senderTel: socket.telephone
+        });
     });
 
     socket.on('heartbeat', () => {
-        if (socket.telephone && registeredUsers.has(socket.telephone)) {
-            const u = registeredUsers.get(socket.telephone);
-            u.lastSeen = Date.now();
-            u.online = true;
-            registeredUsers.set(socket.telephone, u);
-        }
+        const u = socket.telephone && registeredUsers.get(socket.telephone);
+        if (u) { u.lastSeen = Date.now(); u.online = true; }
     });
 
     socket.on('disconnect', () => {
-        console.log(`[-] Déconnexion : ${socket.id}`);
-        if (socket.telephone && registeredUsers.has(socket.telephone)) {
-            const u = registeredUsers.get(socket.telephone);
-            u.online = false;
-            u.lastSeen = Date.now();
-            registeredUsers.set(socket.telephone, u);
+        const tel = socket.telephone;
+        if (!tel) return;
+        const u = registeredUsers.get(tel);
+        if (!u || u.socketId !== socket.id) return;   // un autre appareil a pris la place
+        u.online = false;
+        u.hidden = false;
+        u.lastSeen = Date.now();
+        u.socketId = null;
+
+        // Appel en cours : le flux média est direct (P2P) et survit à une coupure de signalisation.
+        // On laisse 25 s à l'utilisateur pour se reconnecter avant de couper l'appel.
+        const c = activeCalls.get(tel);
+        if (c) {
+            setTimeout(() => {
+                const encore = registeredUsers.get(tel);
+                const cc = activeCalls.get(tel);
+                if (encore && !encore.online && cc && cc.callId === c.callId) {
+                    activeCalls.delete(tel);
+                    activeCalls.delete(cc.peer);
+                    io.to(roomUser(cc.peer)).emit('p2p_signal', { type: 'hangup', sender: tel, callId: cc.callId });
+                }
+            }, 25000).unref();
         }
-        io.emit('presence_update', getOnlineUsers());
+        emettrePresence(tel);
+        saveDataSoon();
     });
 });
 
+// Appels en attente expirés
+setInterval(() => {
+    const now = Date.now();
+    for (const [tel, p] of pendingCalls) if (p.expires < now) pendingCalls.delete(tel);
+}, 15000).unref();
+
+// Nettoie les appels « fantômes » (> 3 h)
+setInterval(() => {
+    const limite = Date.now() - 3 * 3600 * 1000;
+    for (const [tel, c] of activeCalls) if (c.since < limite) activeCalls.delete(tel);
+}, 10 * 60 * 1000).unref();
+
+/* ---------------- HTTP ---------------- */
+app.get('/health', (req, res) => res.status(200).send('ok'));
 app.get('/', (req, res) => {
     res.json({
-        status: 'EVAT Continuum Signaling Server (sécurisé)',
-        online: registeredUsers.size,
-        messages: messageHistory.length,
+        status: 'EVAT Continuum Signaling Server v4.1',
+        push: !!(webpush && vapid),
+        online: compterEnLigne(),
         time: new Date().toISOString()
     });
 });
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(`🚀 Serveur EVAT Continuum (sécurisé) actif sur le port ${PORT}`);
-});
+initialiserPush();
+server.listen(PORT, () => console.log(`🚀 EVAT Continuum v4 actif sur le port ${PORT}`));
+
+function arret() { saveDataNow(); process.exit(0); }
+process.on('SIGTERM', arret);
+process.on('SIGINT', arret);
