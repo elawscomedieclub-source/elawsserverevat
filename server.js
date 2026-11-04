@@ -1,5 +1,5 @@
 /* ============================================================
-   EVAT Continuum — Serveur de signalisation v4.3
+   EVAT Continuum — Serveur de signalisation v4.4
    - Identité serveur-autoritaire (le client ne peut plus usurper "sender/from")
    - PIN hashé avec scrypt + anti brute-force
    - Présence ciblée (plus de diffusion de tous les numéros à tout le monde)
@@ -10,6 +10,8 @@
    - v4.2 : deux IA via l'API Anthropic, en streaming
    - v4.3 : Mister ELAWS (général) + Mister I (métier) sécurisées (mémoire côté serveur, routeur de périmètre,
             plafonds, anti-injection), recherche Internet, TURN Cloudflare, page /diagnostic
+   - v4.4 : inscription ouverte à tous les pays, noms dans toutes les écritures, sonnerie push répétée
+            (le téléphone « sonne » app fermée), test d'appel, IA adaptées au pays de l'utilisateur
    ============================================================ */
 const express = require('express');
 const http = require('http');
@@ -160,10 +162,23 @@ function memoireIA(tel, mode) {
 function metierVague(metier) { return !metier || /^(op[ée]rateur|utilisateur|user|—|-)$/i.test(metier); }
 function nettoyerMetier(m) { return String(m || '').replace(/[\r\n<>{}`]+/g, ' ').trim().slice(0, 80); }
 
-function promptIA(mode, user, web) {
+function fuseauValide(tz) {
+    try { if (tz && typeof tz === 'string' && tz.length < 60) { new Intl.DateTimeFormat('fr-FR', { timeZone: tz }); return tz; } } catch (e) {}
+    return 'UTC';
+}
+function paysValide(p) { return (typeof p === 'string' && /^[A-Z]{2}$/.test(p)) ? p : null; }
+function nomDuPays(iso) {
+    try { return iso ? new Intl.DisplayNames(['fr'], { type: 'region' }).of(iso) : null; } catch (e) { return null; }
+}
+
+function promptIA(mode, user, web, ctx) {
+    ctx = ctx || {};
     const nom = nettoyerMetier(user.nom || "l'utilisateur").slice(0, 80);
-    const maintenant = new Date().toLocaleString('fr-FR', { timeZone: 'Africa/Lome', dateStyle: 'full', timeStyle: 'short' });
-    const contexte = `Date et heure actuelles (Lomé) : ${maintenant}. L'utilisateur s'appelle ${nom}. ` +
+    const tz = fuseauValide(ctx.tz);
+    const pays = nomDuPays(paysValide(ctx.pays));
+    const maintenant = new Date().toLocaleString('fr-FR', { timeZone: tz, dateStyle: 'full', timeStyle: 'short' });
+    const contexte = `Date et heure actuelles chez l'utilisateur (${tz}) : ${maintenant}. L'utilisateur s'appelle ${nom}` +
+        (pays ? ` et vit dans ce pays : ${pays}.` : `.`) + ' ' +
         (web ? `Tu disposes d'un outil de recherche sur Internet : utilise-le quand la réponse dépend d'informations récentes ou locales (prix, tarifs, actualité, lois, horaires, adresses, produits), pas pour ce que tu sais déjà. Cite brièvement tes sources dans la réponse.`
              : `Tu n'as pas accès à Internet : tu ne connais pas l'actualité récente, et tu le dis si la question en dépend.`);
 
@@ -186,10 +201,10 @@ PÉRIMÈTRE
 - Si la question est à la frontière, rattache-la au métier et réponds sous cet angle.
 ${metierVague(metier) ? "- Le métier n'est pas précisé clairement : demande-lui d'abord quel est exactement son métier (et de le renseigner dans Profil) pour pouvoir l'aider efficacement.\n" : ''}
 STYLE
-- Tu es un professionnel chevronné de ce métier, qui parle à un collègue : concret, pratique, sans blabla. Donne des étapes, des exemples chiffrés (en FCFA quand c'est pertinent), des checklists, des modèles prêts à l'emploi (devis, messages aux clients) et les erreurs à éviter.
+- Tu es un professionnel chevronné de ce métier, qui parle à un collègue : concret, pratique, sans blabla. Donne des étapes, des exemples chiffrés (dans la monnaie locale quand c'est pertinent), des checklists, des modèles prêts à l'emploi (devis, messages aux clients) et les erreurs à éviter.
 - Quand on te demande un outil (devis, calcul de prix, checklist, message client), pose d'abord les questions indispensables, UNE à la fois, puis livre un résultat prêt à copier.
-- Adapte-toi aux réalités locales (Togo / Afrique de l'Ouest) sans présumer ; si tu hésites sur un chiffre ou une règle locale, dis-le ou vérifie-le sur Internet.
-- Réponds dans la langue de l'utilisateur (français par défaut). Écran de téléphone : paragraphes courts, listes à puces si utile, pas de tableaux larges.
+- Adapte-toi aux réalités locales du pays de l'utilisateur (monnaie, réglementation, marché, climat) ; si le pays n'est pas connu, demande-le quand c'est utile. Si tu hésites sur un chiffre ou une règle locale, dis-le ou vérifie-le sur Internet.
+- Réponds dans la langue de l'utilisateur (la langue de son message ; français par défaut). Écran de téléphone : paragraphes courts, listes à puces si utile, pas de tableaux larges.
 - Si un point engage la sécurité des personnes (électricité, santé, chantier…), dis-le clairement.
 ${securite}
 
@@ -239,12 +254,12 @@ function sourceValide(r) {
     return { url: r.url, titre: String(r.title || r.url).replace(/[\r\n]+/g, ' ').slice(0, 120) };
 }
 
-async function streamAnthropic({ mode, system, messages, signal, web, onText, onPhase, onSources }) {
+async function streamAnthropic({ mode, system, messages, signal, web, ctx, onText, onPhase, onSources }) {
     const corps = { model: AI_MODELS[mode], max_tokens: AI_MAX_TOKENS, system, messages, stream: true };
     if (web) {
         corps.tools = [{
             type: AI_WEB_TOOL, name: 'web_search', max_uses: AI_WEB_MAX,
-            user_location: { type: 'approximate', country: 'TG', timezone: 'Africa/Lome' }
+            user_location: Object.assign({ type: 'approximate', timezone: fuseauValide(ctx && ctx.tz) }, paysValide(ctx && ctx.pays) ? { country: ctx.pays } : {})
         }];
     }
     const res = await fetch(ANTHROPIC_URL, { method: 'POST', headers: enteteAnthropic(), body: JSON.stringify(corps), signal });
@@ -331,24 +346,41 @@ async function envoyerPush(tel, payload) {
     }
 }
 
+/** Fait « sonner » un téléphone dont l'app est fermée : une notification d'appel immédiate, puis une toutes les 4,5 s
+    (6 au maximum) tant que l'appel n'est ni décroché, ni refusé, ni raccroché, ni reçu par l'app. */
+function sonnerieDistante(tel, callId, payload) {
+    let n = 0;
+    const encore = () => {
+        const p = pendingCalls.get(tel), c = activeCalls.get(tel);
+        return !!(p && p.callId === callId && !p.acked && p.expires > Date.now() && c && c.callId === callId);
+    };
+    if (!encore()) return;
+    envoyerPush(tel, payload); n++;
+    const h = setInterval(() => {
+        if (!encore() || n >= 6) { clearInterval(h); return; }
+        envoyerPush(tel, payload); n++;
+    }, 4500);
+    if (h.unref) h.unref();
+}
+
 // Joignable en direct = connecté ET page visible (sinon on double avec une notification push)
 const joignableDirect = u => !!(u && u.online && !u.hidden);
 
 /* ---------------- Utilitaires ---------------- */
-const NOMS_INTERDITS = [
-    'kodjo marceline', 'kodjo', 'marceline', 'test', 'admin',
-    'utilisateur', 'user', 'exemple', 'demo', 'operateur'
-];
+// Seuls les noms d'exemple EXACTS sont refusés (« Kodjo » ou « Marceline » seuls sont de vrais prénoms)
+const NOMS_INTERDITS = ['kodjo marceline', 'test', 'admin', 'utilisateur', 'user', 'exemple', 'demo', 'operateur'];
 
 const nettoyerTel = tel => tel ? String(tel).replace(/[\s\-.()]/g, '').trim() : '';
-const telEstValide = tel => /^\+[1-9]\d{8,14}$/.test(nettoyerTel(tel));
+const telEstValide = tel => /^\+[1-9]\d{6,14}$/.test(nettoyerTel(tel));   // format international (E.164) : tous les pays
 
 function nomEstValide(nom) {
     if (!nom || typeof nom !== 'string') return false;
-    const n = nom.trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-    if (n.length < 3 || n.length > 80) return false;
-    if (NOMS_INTERDITS.some(x => n === x || n.includes(x))) return false;
-    return /[a-z]/i.test(n);
+    const propre = nom.trim().replace(/\s+/g, ' ');
+    const longueur = [...propre].length;
+    if (longueur < 2 || longueur > 80) return false;
+    const n = propre.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    if (NOMS_INTERDITS.includes(n)) return false;
+    return /\p{L}/u.test(propre);          // lettres de toutes les écritures (latin, arabe, cyrillique, chinois, …)
 }
 
 function genererPin() {
@@ -533,7 +565,7 @@ io.on('connection', (socket) => {
     socket.on('check_phone', (data, cb) => {
         if (!limiteur(socket, 'check', 10, 60000)) return ack(cb, { ok: false, error: 'Trop de requêtes.' });
         const tel = nettoyerTel(data && data.telephone);
-        if (!telEstValide(tel)) return ack(cb, { ok: false, error: 'Numéro invalide. Format attendu : +228XXXXXXXX' });
+        if (!telEstValide(tel)) return ack(cb, { ok: false, error: 'Numéro invalide. Entrez l’indicatif du pays puis le numéro (ex : +33 6 12 34 56 78).' });
         const exists = registeredUsers.has(tel);
         ack(cb, {
             ok: true, exists,
@@ -551,7 +583,7 @@ io.on('connection', (socket) => {
         const nom = String(data.nom).trim().slice(0, 80);
         const metier = String(data.metier || 'Opérateur').trim().slice(0, 80);
 
-        if (!telEstValide(tel)) return ack(cb, { ok: false, error: 'Numéro invalide. Exemple : +22890123456' });
+        if (!telEstValide(tel)) return ack(cb, { ok: false, error: 'Numéro invalide. Entrez l’indicatif du pays puis le numéro (ex : +22890123456).' });
         if (!nomEstValide(nom)) {
             return ack(cb, { ok: false, error: 'Nom invalide ou réservé (exemples / tests interdits). Entrez VOTRE vrai nom et prénom.' });
         }
@@ -717,8 +749,8 @@ io.on('connection', (socket) => {
             pendingCalls.set(to, { callId: msg.callId, from, fromName: msg.senderName, callType: msg.callType,
                                    signals: [msg], expires: Date.now() + 35000, acked: false });
             if (!joignableDirect(cible)) {
-                // téléphone verrouillé / app fermée → notification qui fait « sonner » l'appareil
-                envoyerPush(to, {
+                // téléphone verrouillé / app fermée → notifications répétées : le téléphone joue sa propre sonnerie
+                sonnerieDistante(to, msg.callId, {
                     type: 'call', callId: msg.callId, from, fromName: msg.senderName, callType: msg.callType,
                     title: msg.callType === 'video' ? '📹 Appel vidéo EVAT' : '📞 Appel EVAT',
                     body: msg.senderName + ' vous appelle', tag: 'evat-call'
@@ -806,8 +838,9 @@ io.on('connection', (socket) => {
                 return;
             }
 
+            const ctx = { tz: data.tz, pays: data.pays };
             const lancer = (web) => streamAnthropic({
-                mode, system: promptIA(mode, user, web), messages, signal: ctrl.signal, web,
+                mode, system: promptIA(mode, user, web, ctx), messages, signal: ctrl.signal, web, ctx,
                 onText: envoyer,
                 onPhase: (p) => socket.emit('ai_phase', { reqId, phase: p }),
                 onSources: (src) => socket.emit('ai_sources', { reqId, sources: src })
@@ -863,6 +896,21 @@ io.on('connection', (socket) => {
         ack(cb, { ok: true });
     });
 
+    // Test « app fermée » : 3 notifications d'appel arrivent 8 s plus tard (le temps de fermer l'app)
+    socket.on('push_test', (_, cb) => {
+        const tel = socket.telephone, u = tel && registeredUsers.get(tel);
+        if (!u || !u.push) return ack(cb, { ok: false, error: "Les notifications ne sont pas activées sur cet appareil (touchez « Activer » sur l'accueil)." });
+        if (!limiteur(socket, 'pushtest', 4, 3600000)) return ack(cb, { ok: false, error: 'Quatre tests par heure maximum.' });
+        ack(cb, { ok: true });
+        const payload = { type: 'test', title: "📞 Test d'appel EVAT", body: 'Si vous voyez ceci app fermée, vos appels passeront ✅', tag: 'evat-call' };
+        let n = 0;
+        setTimeout(() => {
+            envoyerPush(tel, payload);
+            const h = setInterval(() => { envoyerPush(tel, payload); if (++n >= 2) clearInterval(h); }, 4500);
+            if (h.unref) h.unref();
+        }, 8000).unref();
+    });
+
     socket.on('visibility', (hidden) => {
         const u = socket.telephone && registeredUsers.get(socket.telephone);
         if (u) u.hidden = !!hidden;
@@ -886,7 +934,7 @@ io.on('connection', (socket) => {
             fromName: me.nom,
             to,
             texte,
-            heure: new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Africa/Lome' }),
+            heure: new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'UTC' }),   // repli : le téléphone affiche l'heure locale à partir de « timestamp »
             timestamp: Date.now(),
             cid: String(payload.cid || '').slice(0, 40),
             delivered: false, read: false
@@ -1034,7 +1082,7 @@ app.get('/diagnostic', async (req, res) => {
     const L = [];   // [statut, titre, détail]
     const ok = (t, d) => L.push(['✅', t, d]), warn = (t, d) => L.push(['⚠️', t, d]), ko = (t, d) => L.push(['❌', t, d]);
 
-    ok('Serveur EVAT', `v4.3 démarré. ${registeredUsers.size} compte(s), ${compterEnLigne()} en ligne.`);
+    ok('Serveur EVAT', `v4.4 démarré. ${registeredUsers.size} compte(s), ${compterEnLigne()} en ligne.`);
 
     // Comptes
     if (process.env.DATA_DIR) ok('Sauvegarde des comptes', 'Un dossier de données est défini (DATA_DIR). Il doit être sur un disque persistant.');
@@ -1102,7 +1150,7 @@ app.get('/diagnostic', async (req, res) => {
 app.get('/health', (req, res) => res.status(200).send('ok'));
 app.get('/', (req, res) => {
     res.json({
-        status: 'EVAT Continuum Signaling Server v4.3',
+        status: 'EVAT Continuum Signaling Server v4.4',
         push: !!(webpush && vapid),
         ai: !!ANTHROPIC_KEY && AI_ENABLED,
         online: compterEnLigne(),
