@@ -1,6 +1,6 @@
 {
   "name": "evat-server",
-  "version": "4.6.0",
+  "version": "4.7.0",
   "description": "Serveur de signalisation WebRTC pour EVAT Continuum",
   "main": "server.js",
   "scripts": {

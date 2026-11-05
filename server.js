@@ -1,5 +1,5 @@
 /* ============================================================
-   EVAT Continuum — Serveur de signalisation v4.6
+   EVAT Continuum — Serveur de signalisation v4.7
    - Identité serveur-autoritaire (le client ne peut plus usurper "sender/from")
    - PIN hashé avec scrypt + anti brute-force
    - Présence ciblée (plus de diffusion de tous les numéros à tout le monde)
@@ -17,6 +17,7 @@
    - v4.6 : sauvegarde externe gratuite (Upstash Redis) des comptes et des abonnements aux notifications :
             le serveur Render gratuit peut s'endormir/redémarrer sans que les téléphones deviennent injoignables ;
             réponse « numéro inconnu » ; état des notifications ; journal d'appels (numéros masqués)
+   - v4.7 : un compte inconnu du serveur (redémarrage) demande à l'app de se ré-inscrire seule ; Upstash 401 expliqué
    ============================================================ */
 const express = require('express');
 const http = require('http');
@@ -161,7 +162,7 @@ async function chargerDepuisUpstash() {
         console.log(`☁️ Upstash : ${n} compte(s) restauré(s)`);
     } catch (e) {
         upEtat = { ok: false, erreur: e.message, comptes: 0 };
-        console.warn('[Upstash] chargement impossible :', e.message);
+        console.warn('[Upstash] chargement impossible :', e.message, /401|403/.test(e.message) ? '→ jeton ou adresse incorrects : recopiez-les depuis l\'onglet REST API d\'Upstash' : '');
     }
 }
 
@@ -774,7 +775,7 @@ io.on('connection', (socket) => {
             saveDataSoon();
             return ack(cb, { ok: true, restored: true });
         }
-        ack(cb, { ok: false, error: 'Impossible de lier ce numéro sans code de récupération.' });
+        ack(cb, { ok: false, needsNew: true, error: 'Compte inconnu du serveur : restauration en cours.' });
     });
 
     // Contacts + abonnement à leur présence (uniquement eux, pas tout le monde)
@@ -1023,7 +1024,7 @@ io.on('connection', (socket) => {
 
     socket.on('push_status', (_, cb) => {
         const u = socket.telephone && registeredUsers.get(socket.telephone);
-        ack(cb, { abonne: !!(u && u.push), serveurPush: !!(webpush && vapid), sauvegarde: upstashActif ? upEtat.ok === true : null });
+        ack(cb, { liee: !!socket.telephone, abonne: !!(u && u.push), serveurPush: !!(webpush && vapid), sauvegarde: upstashActif ? upEtat.ok === true : null });
     });
 
     socket.on('visibility', (hidden) => {
@@ -1197,7 +1198,7 @@ app.get('/diagnostic', async (req, res) => {
     const L = [];   // [statut, titre, détail]
     const ok = (t, d) => L.push(['✅', t, d]), warn = (t, d) => L.push(['⚠️', t, d]), ko = (t, d) => L.push(['❌', t, d]);
 
-    ok('Serveur EVAT', `v4.6 démarré. ${registeredUsers.size} compte(s), ${compterEnLigne()} en ligne.`);
+    ok('Serveur EVAT', `v4.7 démarré. ${registeredUsers.size} compte(s), ${compterEnLigne()} en ligne.`);
 
     // Comptes
     if (upstashActif) {
@@ -1205,7 +1206,11 @@ app.get('/diagnostic', async (req, res) => {
             if (test) await upstash(['PING']);
             if (upEtat.ok === false) ko('Sauvegarde externe (Upstash)', 'Configurée mais en erreur : ' + esc(upEtat.erreur));
             else ok('Sauvegarde externe (Upstash)', `Active. ${upEtat.comptes} compte(s) restauré(s) au dernier démarrage${test ? '. Connexion testée : OK.' : '.'}`);
-        } catch (e) { ko('Sauvegarde externe (Upstash)', 'Test impossible : ' + esc(e.message)); }
+        } catch (e) {
+            ko('Sauvegarde externe (Upstash)', /401|403/.test(e.message)
+                ? 'Upstash refuse vos identifiants (' + esc(e.message) + '). Recopiez UPSTASH_REDIS_REST_URL et UPSTASH_REDIS_REST_TOKEN depuis l\'onglet « REST API » (pas l\'onglet Redis), sans guillemets ni espace, avec le jeton normal (pas « Read-Only »).'
+                : 'Test impossible : ' + esc(e.message));
+        }
     } else if (process.env.DATA_DIR) ok('Sauvegarde des comptes', 'Dossier de données défini (DATA_DIR). Il doit être sur un disque persistant.');
     else ko('Sauvegarde des comptes', "Aucune sauvegarde : à chaque redémarrage de Render, les comptes ET les abonnements aux notifications sont perdus, donc un téléphone dont l'app est fermée ne peut plus sonner. Activez Upstash (gratuit) : variables UPSTASH_REDIS_REST_URL et UPSTASH_REDIS_REST_TOKEN.");
 
@@ -1271,7 +1276,7 @@ app.get('/diagnostic', async (req, res) => {
 app.get('/health', (req, res) => res.status(200).send('ok'));
 app.get('/', (req, res) => {
     res.json({
-        status: 'EVAT Continuum Signaling Server v4.6',
+        status: 'EVAT Continuum Signaling Server v4.7',
         push: !!(webpush && vapid),
         ai: !!ANTHROPIC_KEY && AI_ENABLED,
         online: compterEnLigne(),
@@ -1282,7 +1287,7 @@ app.get('/', (req, res) => {
 (async () => {
     await Promise.race([chargerDepuisUpstash(), new Promise(r => setTimeout(r, 8000))]);   // jamais bloqué plus de 8 s
     initialiserPush();
-    server.listen(PORT, () => console.log(`🚀 EVAT Continuum v4.6 actif sur le port ${PORT}`));
+    server.listen(PORT, () => console.log(`🚀 EVAT Continuum v4.7 actif sur le port ${PORT}`));
 })();
 
 async function arret() {
