@@ -1,5 +1,5 @@
 /* ============================================================
-   EVAT Continuum — Serveur de signalisation v4.4
+   EVAT Continuum — Serveur de signalisation v4.6
    - Identité serveur-autoritaire (le client ne peut plus usurper "sender/from")
    - PIN hashé avec scrypt + anti brute-force
    - Présence ciblée (plus de diffusion de tous les numéros à tout le monde)
@@ -12,6 +12,11 @@
             plafonds, anti-injection), recherche Internet, TURN Cloudflare, page /diagnostic
    - v4.4 : inscription ouverte à tous les pays, noms dans toutes les écritures, sonnerie push répétée
             (le téléphone « sonne » app fermée), test d'appel, IA adaptées au pays de l'utilisateur
+   - v4.5 : filet de sécurité d'appel (si l'app ne confirme pas la sonnerie en 2,5 s → notifications push),
+            appels manqués toujours notifiés, avec identifiant d'appel pour l'historique
+   - v4.6 : sauvegarde externe gratuite (Upstash Redis) des comptes et des abonnements aux notifications :
+            le serveur Render gratuit peut s'endormir/redémarrer sans que les téléphones deviennent injoignables ;
+            réponse « numéro inconnu » ; état des notifications ; journal d'appels (numéros masqués)
    ============================================================ */
 const express = require('express');
 const http = require('http');
@@ -78,6 +83,7 @@ function loadData() {
 
 let saveTimer = null;
 function saveDataSoon() {
+    upstashSauverSoon();
     if (saveTimer) return;
     saveTimer = setTimeout(() => {
         saveTimer = null;
@@ -102,6 +108,93 @@ function saveDataNow() {
 }
 loadData();
 
+
+
+/* ---------------- Sauvegarde externe : Upstash Redis (gratuit) ----------------
+   Render gratuit s'endort et efface sa mémoire : sans sauvegarde, le serveur « oublie » les comptes ET les abonnements
+   aux notifications, donc un téléphone dont l'app est fermée ne peut plus être appelé. Variables à définir :
+   UPSTASH_REDIS_REST_URL et UPSTASH_REDIS_REST_TOKEN. */
+const UP_URL = (process.env.UPSTASH_REDIS_REST_URL || '').trim().replace(/\/+$/, '');
+const UP_TOKEN = (process.env.UPSTASH_REDIS_REST_TOKEN || '').trim();
+const upstashActif = !!(UP_URL && UP_TOKEN);
+const upDerniers = new Map();      // tel -> dernier JSON enregistré (on n'écrit que ce qui change)
+let upMessagesJson = '', upMessagesT = 0, upTimer = null, upEtat = { ok: null, erreur: '', comptes: 0 };
+
+async function upstash(commande, pipeline) {
+    const r = await fetch(UP_URL + (pipeline ? '/pipeline' : ''), {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + UP_TOKEN, 'Content-Type': 'application/json' },
+        body: JSON.stringify(commande)
+    });
+    if (!r.ok) throw new Error('Upstash ' + r.status);
+    const j = await r.json();
+    if (!pipeline && j.error) throw new Error(j.error);
+    return pipeline ? j : j.result;
+}
+
+function jsonUtilisateur(u) {       // sans « lastSeen » : il change sans cesse et ferait écrire pour rien
+    return JSON.stringify({ nom: u.nom, metier: u.metier, pinHash: u.pinHash, pinSalt: u.pinSalt, createdAt: u.createdAt, push: u.push || null });
+}
+
+async function chargerDepuisUpstash() {
+    if (!upstashActif) return;
+    try {
+        const plat = await upstash(['HGETALL', 'evat:users']);
+        let n = 0;
+        for (let i = 0; i + 1 < (plat || []).length; i += 2) {
+            try {
+                const u = JSON.parse(plat[i + 1]);
+                registeredUsers.set(plat[i], {
+                    nom: u.nom, metier: u.metier, pinHash: u.pinHash, pinSalt: u.pinSalt,
+                    createdAt: u.createdAt, lastSeen: u.createdAt, push: u.push || null,
+                    online: false, hidden: false, socketId: null
+                });
+                upDerniers.set(plat[i], plat[i + 1]);
+                n++;
+            } catch (e) { /* entrée illisible : ignorée */ }
+        }
+        const msgs = await upstash(['GET', 'evat:messages']);
+        if (msgs) {
+            try { JSON.parse(msgs).forEach(m => messageHistory.push(m)); upMessagesJson = msgs; } catch (e) {}
+        }
+        upEtat = { ok: true, erreur: '', comptes: n };
+        console.log(`☁️ Upstash : ${n} compte(s) restauré(s)`);
+    } catch (e) {
+        upEtat = { ok: false, erreur: e.message, comptes: 0 };
+        console.warn('[Upstash] chargement impossible :', e.message);
+    }
+}
+
+function upstashSauverSoon() {
+    if (!upstashActif || upTimer) return;
+    upTimer = setTimeout(upstashEnvoyer, 4000);
+    if (upTimer.unref) upTimer.unref();
+}
+
+async function upstashEnvoyer() {
+    upTimer = null;
+    if (!upstashActif) return;
+    const cmds = [], suites = [];
+    for (const [tel, u] of registeredUsers) {
+        const j = jsonUtilisateur(u);
+        if (upDerniers.get(tel) !== j) { cmds.push(['HSET', 'evat:users', tel, j]); suites.push(() => upDerniers.set(tel, j)); }
+    }
+    if (Date.now() - upMessagesT > 30000) {
+        const mj = JSON.stringify(messageHistory.slice(-MAX_HISTORY));
+        if (mj !== upMessagesJson) { cmds.push(['SET', 'evat:messages', mj]); suites.push(() => { upMessagesJson = mj; upMessagesT = Date.now(); }); }
+    }
+    if (!cmds.length) return;
+    try {
+        const res = await upstash(cmds, true);
+        if (Array.isArray(res) && res.some(x => x && x.error)) throw new Error(res.find(x => x && x.error).error);
+        suites.forEach(f => f());
+        upEtat.ok = true; upEtat.erreur = '';
+    } catch (e) {
+        upEtat.ok = false; upEtat.erreur = e.message;
+        console.warn('[Upstash] sauvegarde impossible :', e.message);
+        upstashSauverSoon();                       // on réessaiera
+    }
+}
 
 /* ---------------- IA : Mister ELAWS (généraliste) + Mister I (métier) ----------------
    La clé reste sur le serveur (ANTHROPIC_API_KEY) : jamais dans l'application.
@@ -559,6 +652,9 @@ async function construireIce() {
 }
 
 /* ---------------- Socket.io ---------------- */
+const masque = t => '***' + String(t || '').slice(-3);
+const logAppel = (evt, de, vers, id, extra) =>
+    console.log(`[APPEL] ${evt} ${masque(de)}→${masque(vers)} #${String(id || '').slice(0, 6)}${extra ? ' ' + extra : ''}`);
 const TYPES_SIGNAL = new Set(['offer', 'answer', 'ice_candidate', 'hangup', 'reject', 'busy', 'ringing']);
 
 io.on('connection', (socket) => {
@@ -717,7 +813,15 @@ io.on('connection', (socket) => {
         const from = socket.telephone;
         const to = nettoyerTel(data.target);
         const cible = registeredUsers.get(to);
-        if (!cible || to === from) return;
+        if (to === from) return;
+        if (!cible) {
+            // Numéro sans compte (ou serveur qui vient de redémarrer sans sauvegarde) : on le dit à l'appelant au lieu de se taire
+            if (data.type === 'offer') {
+                logAppel('inconnu', from, to, data.callId);
+                socket.emit('p2p_signal', { type: 'user_unknown', sender: to, callId: String(data.callId || '').slice(0, 40) });
+            }
+            return;
+        }
 
         const msg = {
             type: data.type,
@@ -736,7 +840,7 @@ io.on('connection', (socket) => {
             if (!cible.online && !cible.push) {
                 socket.emit('p2p_signal', { type: 'user_offline', sender: to, callId: msg.callId });
                 const l = missedCalls.get(to) || [];
-                l.push({ from, fromName: msg.senderName, at: Date.now(), callType: msg.callType });
+                l.push({ from, fromName: msg.senderName, at: Date.now(), callType: msg.callType, callId: msg.callId });
                 missedCalls.set(to, l.slice(-20));
                 return;
             }
@@ -744,17 +848,23 @@ io.on('connection', (socket) => {
                 socket.emit('p2p_signal', { type: 'busy', sender: to, callId: msg.callId });
                 return;
             }
+            logAppel('offre', from, to, msg.callId, `destinataire: ${cible.online ? (cible.hidden ? 'en ligne, cache' : 'en ligne') : 'hors ligne'}${cible.push ? ', push ok' : ', SANS push'}`);
             activeCalls.set(from, { peer: to, callId: msg.callId, since: Date.now() });
             activeCalls.set(to, { peer: from, callId: msg.callId, since: Date.now() });
             pendingCalls.set(to, { callId: msg.callId, from, fromName: msg.senderName, callType: msg.callType,
                                    signals: [msg], expires: Date.now() + 35000, acked: false });
+            const payloadAppel = {
+                type: 'call', callId: msg.callId, from, fromName: msg.senderName, callType: msg.callType,
+                title: msg.callType === 'video' ? '📹 Appel vidéo EVAT' : '📞 Appel EVAT',
+                body: msg.senderName + ' vous appelle', tag: 'evat-call'
+            };
             if (!joignableDirect(cible)) {
                 // téléphone verrouillé / app fermée → notifications répétées : le téléphone joue sa propre sonnerie
-                sonnerieDistante(to, msg.callId, {
-                    type: 'call', callId: msg.callId, from, fromName: msg.senderName, callType: msg.callType,
-                    title: msg.callType === 'video' ? '📹 Appel vidéo EVAT' : '📞 Appel EVAT',
-                    body: msg.senderName + ' vous appelle', tag: 'evat-call'
-                });
+                sonnerieDistante(to, msg.callId, payloadAppel);
+            } else {
+                // Le serveur croit l'app ouverte, mais elle peut être gelée (écran éteint, réseau coupé) :
+                // si elle ne confirme pas la sonnerie en 2,5 s, on envoie quand même les notifications.
+                setTimeout(() => sonnerieDistante(to, msg.callId, payloadAppel), 2500).unref();
             }
         } else {
             // candidats ICE : mis de côté tant que le destinataire n'a pas reçu l'offre
@@ -767,18 +877,18 @@ io.on('connection', (socket) => {
         if (data.type === 'ringing') {
             const p = pendingCalls.get(from);
             if (p && p.callId === msg.callId) p.acked = true;   // le destinataire a bien reçu l'appel
+            logAppel('sonne', from, to, msg.callId);
         }
 
         if (data.type === 'answer' || data.type === 'reject' || data.type === 'hangup' || data.type === 'busy') {
+            logAppel(data.type === 'answer' ? 'decroche' : data.type, from, to, msg.callId);
             // Appel jamais décroché ni reçu → appel manqué (notification push)
             const p = pendingCalls.get(to);
             if (data.type === 'hangup' && p && p.callId === msg.callId && !p.acked) {
                 const l = missedCalls.get(to) || [];
-                l.push({ from, fromName: msg.senderName, at: Date.now(), callType: msg.callType });
+                l.push({ from, fromName: msg.senderName, at: Date.now(), callType: msg.callType, callId: msg.callId });
                 missedCalls.set(to, l.slice(-20));
-                if (!joignableDirect(cible)) {
-                    envoyerPush(to, { type: 'missed', title: '📵 Appel manqué', body: msg.senderName + ' a essayé de vous joindre', tag: 'evat-missed', from });
-                }
+                envoyerPush(to, { type: 'missed', title: '📵 Appel manqué', body: msg.senderName + ' a essayé de vous joindre', tag: 'evat-missed', from, callId: msg.callId });
             }
             pendingCalls.delete(to); pendingCalls.delete(from);
         }
@@ -909,6 +1019,11 @@ io.on('connection', (socket) => {
             const h = setInterval(() => { envoyerPush(tel, payload); if (++n >= 2) clearInterval(h); }, 4500);
             if (h.unref) h.unref();
         }, 8000).unref();
+    });
+
+    socket.on('push_status', (_, cb) => {
+        const u = socket.telephone && registeredUsers.get(socket.telephone);
+        ack(cb, { abonne: !!(u && u.push), serveurPush: !!(webpush && vapid), sauvegarde: upstashActif ? upEtat.ok === true : null });
     });
 
     socket.on('visibility', (hidden) => {
@@ -1082,11 +1197,17 @@ app.get('/diagnostic', async (req, res) => {
     const L = [];   // [statut, titre, détail]
     const ok = (t, d) => L.push(['✅', t, d]), warn = (t, d) => L.push(['⚠️', t, d]), ko = (t, d) => L.push(['❌', t, d]);
 
-    ok('Serveur EVAT', `v4.4 démarré. ${registeredUsers.size} compte(s), ${compterEnLigne()} en ligne.`);
+    ok('Serveur EVAT', `v4.6 démarré. ${registeredUsers.size} compte(s), ${compterEnLigne()} en ligne.`);
 
     // Comptes
-    if (process.env.DATA_DIR) ok('Sauvegarde des comptes', 'Un dossier de données est défini (DATA_DIR). Il doit être sur un disque persistant.');
-    else warn('Sauvegarde des comptes', "Pas de disque persistant : les comptes sont perdus à chaque redémarrage de Render (les téléphones se reconnectent seuls). Optionnel : ajoutez un Disk Render.");
+    if (upstashActif) {
+        try {
+            if (test) await upstash(['PING']);
+            if (upEtat.ok === false) ko('Sauvegarde externe (Upstash)', 'Configurée mais en erreur : ' + esc(upEtat.erreur));
+            else ok('Sauvegarde externe (Upstash)', `Active. ${upEtat.comptes} compte(s) restauré(s) au dernier démarrage${test ? '. Connexion testée : OK.' : '.'}`);
+        } catch (e) { ko('Sauvegarde externe (Upstash)', 'Test impossible : ' + esc(e.message)); }
+    } else if (process.env.DATA_DIR) ok('Sauvegarde des comptes', 'Dossier de données défini (DATA_DIR). Il doit être sur un disque persistant.');
+    else ko('Sauvegarde des comptes', "Aucune sauvegarde : à chaque redémarrage de Render, les comptes ET les abonnements aux notifications sont perdus, donc un téléphone dont l'app est fermée ne peut plus sonner. Activez Upstash (gratuit) : variables UPSTASH_REDIS_REST_URL et UPSTASH_REDIS_REST_TOKEN.");
 
     // IA
     if (!AI_ENABLED) warn('IA', 'Désactivée volontairement (AI_ENABLED=false).');
@@ -1150,7 +1271,7 @@ app.get('/diagnostic', async (req, res) => {
 app.get('/health', (req, res) => res.status(200).send('ok'));
 app.get('/', (req, res) => {
     res.json({
-        status: 'EVAT Continuum Signaling Server v4.4',
+        status: 'EVAT Continuum Signaling Server v4.6',
         push: !!(webpush && vapid),
         ai: !!ANTHROPIC_KEY && AI_ENABLED,
         online: compterEnLigne(),
@@ -1158,9 +1279,16 @@ app.get('/', (req, res) => {
     });
 });
 
-initialiserPush();
-server.listen(PORT, () => console.log(`🚀 EVAT Continuum v4 actif sur le port ${PORT}`));
+(async () => {
+    await Promise.race([chargerDepuisUpstash(), new Promise(r => setTimeout(r, 8000))]);   // jamais bloqué plus de 8 s
+    initialiserPush();
+    server.listen(PORT, () => console.log(`🚀 EVAT Continuum v4.6 actif sur le port ${PORT}`));
+})();
 
-function arret() { saveDataNow(); process.exit(0); }
+async function arret() {
+    saveDataNow();
+    try { await Promise.race([upstashEnvoyer(), new Promise(r => setTimeout(r, 4000))]); } catch (e) {}
+    process.exit(0);
+}
 process.on('SIGTERM', arret);
 process.on('SIGINT', arret);
