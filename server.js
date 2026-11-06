@@ -1,5 +1,5 @@
 /* ============================================================
-   EVAT Continuum — Serveur de signalisation v4.8
+   EVAT Continuum — Serveur de signalisation v4.9
    - Identité serveur-autoritaire (le client ne peut plus usurper "sender/from")
    - PIN hashé avec scrypt + anti brute-force
    - Présence ciblée (plus de diffusion de tous les numéros à tout le monde)
@@ -19,6 +19,7 @@
             réponse « numéro inconnu » ; état des notifications ; journal d'appels (numéros masqués)
    - v4.7 : un compte inconnu du serveur (redémarrage) demande à l'app de se ré-inscrire seule ; Upstash 401 expliqué
    - v4.8 : panneau d'administration (/admin) : voir, bloquer, supprimer les comptes, redonner un code de récupération
+   - v4.9 : identifiants TURN nettoyés (copier-coller) et vérifiés pour de vrai depuis le serveur (page /diagnostic)
    ============================================================ */
 const express = require('express');
 const http = require('http');
@@ -638,32 +639,131 @@ async function iceDepuisCloudflare() {
     return liste;
 }
 
+// Valeurs TURN nettoyées (le copier-coller laisse des espaces, guillemets ou caractères invisibles)
+function turnConf() {
+    return {
+        urls: nettoyerEnv(process.env.TURN_URLS).split(',').filter(Boolean),
+        user: nettoyerEnv(process.env.TURN_USERNAME),
+        cred: nettoyerEnv(process.env.TURN_CREDENTIAL),
+        secret: nettoyerEnv(process.env.TURN_SECRET)
+    };
+}
+
 function typeTurnConfigure() {
+    const t = turnConf();
     if (CF_TURN_ID && CF_TURN_TOKEN) return 'cloudflare';
-    if ((process.env.TURN_URLS || '').trim() && process.env.TURN_SECRET) return 'coturn';
-    if ((process.env.TURN_URLS || '').trim() && process.env.TURN_USERNAME && process.env.TURN_CREDENTIAL) return 'manuel';
+    if (t.urls.length && t.secret) return 'coturn';
+    if (t.urls.length && t.user && t.cred) return 'manuel';
     return null;
 }
 
 async function construireIce() {
     const servers = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
     try {
-        const type = typeTurnConfigure();
+        const type = typeTurnConfigure(), t = turnConf();
         if (type === 'cloudflare') {
             servers.push(...await iceDepuisCloudflare());
         } else if (type === 'coturn') {
-            const urls = process.env.TURN_URLS.split(',').map(s => s.trim()).filter(Boolean);
             const expiry = Math.floor(Date.now() / 1000) + 6 * 3600;
             const username = `${expiry}:evat`;
-            servers.push({ urls, username, credential: crypto.createHmac('sha1', process.env.TURN_SECRET).update(username).digest('base64') });
+            servers.push({ urls: t.urls, username, credential: crypto.createHmac('sha1', t.secret).update(username).digest('base64') });
         } else if (type === 'manuel') {
-            const urls = process.env.TURN_URLS.split(',').map(s => s.trim()).filter(Boolean);
-            servers.push({ urls, username: process.env.TURN_USERNAME, credential: process.env.TURN_CREDENTIAL });
+            servers.push({ urls: t.urls, username: t.user, credential: t.cred });
         }
     } catch (e) {
         console.warn('[TURN]', e.message);   // on retombe sur STUN seul plutôt que de bloquer l'appel
     }
     return servers;
+}
+
+/* ---- Vérification RÉELLE des identifiants TURN depuis le serveur (protocole STUN/TURN, RFC 5389 / 5766) ----
+   On envoie une demande « Allocate » : le relais répond 401 + « realm » + « nonce », on renvoie la demande signée
+   avec l'identifiant et le mot de passe : « succès » = identifiants valides, « 401 » = identifiants refusés. */
+const net = require('net');
+const dgram = require('dgram');
+const STUN_COOKIE = 0x2112A442;
+const stunAttr = (type, valeur) => {
+    const pad = (4 - valeur.length % 4) % 4, b = Buffer.alloc(4 + valeur.length + pad);
+    b.writeUInt16BE(type, 0); b.writeUInt16BE(valeur.length, 2); valeur.copy(b, 4);
+    return b;
+};
+function stunMessage(type, txId, attrs, cleIntegrite) {
+    let corps = Buffer.concat(attrs);
+    if (cleIntegrite) {
+        const tmp = Buffer.alloc(20);
+        tmp.writeUInt16BE(type, 0); tmp.writeUInt16BE(corps.length + 24, 2); tmp.writeUInt32BE(STUN_COOKIE, 4); txId.copy(tmp, 8);
+        corps = Buffer.concat([corps, stunAttr(0x0008, crypto.createHmac('sha1', cleIntegrite).update(Buffer.concat([tmp, corps])).digest())]);
+    }
+    const h = Buffer.alloc(20);
+    h.writeUInt16BE(type, 0); h.writeUInt16BE(corps.length, 2); h.writeUInt32BE(STUN_COOKIE, 4); txId.copy(h, 8);
+    return Buffer.concat([h, corps]);
+}
+function stunLire(buf) {
+    if (buf.length < 20) return null;
+    const type = buf.readUInt16BE(0), len = buf.readUInt16BE(2), attrs = {};
+    for (let o = 20; o + 4 <= 20 + len && o + 4 <= buf.length;) {
+        const t = buf.readUInt16BE(o), l = buf.readUInt16BE(o + 2);
+        attrs[t] = buf.slice(o + 4, o + 4 + l);
+        o += 4 + l + ((4 - l % 4) % 4);
+    }
+    return { type, attrs, longueur: 20 + len };
+}
+const codeErreurStun = m => (m && m.attrs[0x0009] && m.attrs[0x0009].length >= 4) ? m.attrs[0x0009][2] * 100 + m.attrs[0x0009][3] : 0;
+
+function ouvrirCanalTurn(hote, port, tcp) {
+    return new Promise((resolve, reject) => {
+        const delai = setTimeout(() => reject(new Error('délai dépassé')), 5000);
+        const fin = (c) => { clearTimeout(delai); resolve(c); };
+        if (tcp) {
+            const sock = net.connect({ host: hote, port }, () => {
+                let tampon = Buffer.alloc(0), attente = null;
+                sock.on('data', d => {
+                    tampon = Buffer.concat([tampon, d]);
+                    if (tampon.length >= 20 && tampon.length >= 20 + tampon.readUInt16BE(2) && attente) { const a = attente; attente = null; const m = tampon.slice(0, 20 + tampon.readUInt16BE(2)); tampon = tampon.slice(m.length); a(m); }
+                });
+                fin({
+                    echange: (msg) => new Promise((ok, ko) => { const t = setTimeout(() => ko(new Error('pas de réponse')), 5000); attente = m => { clearTimeout(t); ok(m); }; sock.write(msg); }),
+                    fermer: () => sock.destroy()
+                });
+            });
+            sock.on('error', e => { clearTimeout(delai); reject(e); });
+        } else {
+            const sock = dgram.createSocket('udp4');
+            sock.on('error', e => { clearTimeout(delai); reject(e); });
+            fin({
+                echange: (msg) => new Promise((ok, ko) => { const t = setTimeout(() => ko(new Error('pas de réponse')), 4000); sock.once('message', m => { clearTimeout(t); ok(m); }); sock.send(msg, port, hote); }),
+                fermer: () => { try { sock.close(); } catch (e) {} }
+            });
+        }
+    });
+}
+
+/** → { etat: 'ok' | 'refuse' | 'injoignable' | 'erreur', detail } */
+async function verifierTurn(url, utilisateur, motDePasse) {
+    const m = /^turn:([^:?]+)(?::(\d+))?(?:\?transport=(udp|tcp))?$/i.exec(url);
+    if (!m) return { etat: 'erreur', detail: 'adresse non vérifiable' };
+    const hote = m[1], port = parseInt(m[2], 10) || 3478, tcp = (m[3] || '').toLowerCase() === 'tcp';
+    let canal;
+    try { canal = await ouvrirCanalTurn(hote, port, tcp); } catch (e) { return { etat: 'injoignable', detail: e.message }; }
+    try {
+        const transport = stunAttr(0x0019, Buffer.from([17, 0, 0, 0]));
+        const tx1 = crypto.randomBytes(12);
+        const r1 = stunLire(await canal.echange(stunMessage(0x0003, tx1, [transport])));
+        if (!r1) return { etat: 'erreur', detail: 'réponse illisible' };
+        if (r1.type === 0x0103) return { etat: 'ok', detail: 'accepte sans identifiant' };
+        if (r1.type !== 0x0113 || !r1.attrs[0x0014] || !r1.attrs[0x0015]) return { etat: 'erreur', detail: 'réponse inattendue' };
+        const realm = r1.attrs[0x0014], nonce = r1.attrs[0x0015];
+        const cle = crypto.createHash('md5').update(`${utilisateur}:${realm.toString()}:${motDePasse}`).digest();
+        const tx2 = crypto.randomBytes(12);
+        const r2 = stunLire(await canal.echange(stunMessage(0x0003, tx2,
+            [transport, stunAttr(0x0006, Buffer.from(utilisateur)), stunAttr(0x0014, realm), stunAttr(0x0015, nonce)], cle)));
+        if (!r2) return { etat: 'erreur', detail: 'réponse illisible' };
+        if (r2.type === 0x0103) return { etat: 'ok', detail: 'identifiants acceptés' };
+        const code = codeErreurStun(r2);
+        return (code === 401 || code === 438 || code === 403) ? { etat: 'refuse', detail: 'erreur ' + code } : { etat: 'erreur', detail: 'erreur ' + (code || '?') };
+    } catch (e) {
+        return { etat: 'injoignable', detail: e.message };
+    } finally { canal.fermer(); }
 }
 
 /* ---------------- Socket.io ---------------- */
@@ -1405,7 +1505,7 @@ app.get('/diagnostic', async (req, res) => {
     const L = [];   // [statut, titre, détail]
     const ok = (t, d) => L.push(['✅', t, d]), warn = (t, d) => L.push(['⚠️', t, d]), ko = (t, d) => L.push(['❌', t, d]);
 
-    ok('Serveur EVAT', `v4.8 démarré. ${registeredUsers.size} compte(s), ${compterEnLigne()} en ligne.`);
+    ok('Serveur EVAT', `v4.9 démarré. ${registeredUsers.size} compte(s), ${compterEnLigne()} en ligne.`);
 
     // Comptes
     if (upstashActif && !upUrlValide) {
@@ -1463,9 +1563,25 @@ app.get('/diagnostic', async (req, res) => {
 
     // TURN
     const tt = typeTurnConfigure();
-    if (!tt) warn('Appels sur réseau mobile (TURN)', 'Pas de serveur TURN : les appels échoueront souvent entre deux téléphones en 3G/4G. Voir le guide (Cloudflare, gratuit).');
-    else if (!test) ok('Appels sur réseau mobile (TURN)', `Configuré (${tt}). Ajoutez &test=1 pour le tester.`);
-    else {
+    if (!tt) warn('Appels sur réseau mobile (TURN)', 'Pas de serveur TURN : les appels échoueront souvent entre deux téléphones en 3G/4G. Voir le guide (Cloudflare ou Metered, gratuits).');
+    else if (!test) ok('Appels sur réseau mobile (TURN)', `Configuré (${tt}). Ajoutez &test=1 pour vérifier réellement les identifiants.`);
+    else if (tt === 'manuel' || tt === 'coturn') {
+        try {
+            const t = turnConf();
+            let utilisateurTest = t.user, motTest = t.cred;
+            if (tt === 'coturn') { utilisateurTest = `${Math.floor(Date.now() / 1000) + 3600}:evat`; motTest = crypto.createHmac('sha1', t.secret).update(utilisateurTest).digest('base64'); }
+            const cibles = t.urls.filter(u => /^turn:/i.test(u));
+            const resultats = [];
+            for (const u of cibles.slice(0, 3)) resultats.push({ u, r: await verifierTurn(u, utilisateurTest, motTest) });
+            const bon = resultats.find(x => x.r.etat === 'ok');
+            const refus = resultats.find(x => x.r.etat === 'refuse');
+            const detail = resultats.map(x => `${x.u.replace(/^turn:/, '')} → ${x.r.etat}${x.r.detail ? ' (' + x.r.detail + ')' : ''}`).join(' | ');
+            if (bon) ok('Appels sur réseau mobile (TURN)', `Identifiants VÉRIFIÉS : le relais les accepte. (${detail})`);
+            else if (refus) ko('Appels sur réseau mobile (TURN)', `Le relais REFUSE vos identifiants (${detail}). Recopiez TURN_USERNAME et TURN_CREDENTIAL depuis le tableau de bord Metered, un par un, avec le bouton Copy.`);
+            else if (!cibles.length) warn('Appels sur réseau mobile (TURN)', 'Aucune adresse « turn: » à tester (seulement « turns: »).');
+            else warn('Appels sur réseau mobile (TURN)', `Le serveur n'a pas pu joindre le relais pour vérifier (${detail}). Cela ne prouve pas que les identifiants sont faux : utilisez le test dans l'application.`);
+        } catch (e) { ko('Appels sur réseau mobile (TURN)', esc(e.message)); }
+    } else {
         try {
             const ice = await construireIce();
             const nb = ice.filter(x => [].concat(x.urls).some(u => /^turns?:/.test(u))).length;
@@ -1486,7 +1602,7 @@ app.get('/diagnostic', async (req, res) => {
 app.get('/health', (req, res) => res.status(200).send('ok'));
 app.get('/', (req, res) => {
     res.json({
-        status: 'EVAT Continuum Signaling Server v4.8',
+        status: 'EVAT Continuum Signaling Server v4.9',
         push: !!(webpush && vapid),
         ai: !!ANTHROPIC_KEY && AI_ENABLED,
         online: compterEnLigne(),
@@ -1497,7 +1613,7 @@ app.get('/', (req, res) => {
 (async () => {
     await Promise.race([chargerDepuisUpstash(), new Promise(r => setTimeout(r, 8000))]);   // jamais bloqué plus de 8 s
     initialiserPush();
-    server.listen(PORT, () => console.log(`🚀 EVAT Continuum v4.8 actif sur le port ${PORT}`));
+    server.listen(PORT, () => console.log(`🚀 EVAT Continuum v4.9 actif sur le port ${PORT}`));
 })();
 
 async function arret() {
