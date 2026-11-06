@@ -20,6 +20,7 @@
    - v4.7 : un compte inconnu du serveur (redémarrage) demande à l'app de se ré-inscrire seule ; Upstash 401 expliqué
    - v4.8 : panneau d'administration (/admin) : voir, bloquer, supprimer les comptes, redonner un code de récupération
    - v4.9 : identifiants TURN nettoyés (copier-coller) et vérifiés pour de vrai depuis le serveur (page /diagnostic)
+   - v4.10 : admin enrichi (messages, alerte globale, notes, avertissements, demandes de réactivation, filtres) ; présence limitée aux contacts
    ============================================================ */
 const express = require('express');
 const http = require('http');
@@ -49,7 +50,7 @@ const io = new Server(server, {
     cors: { origin: corsOrigin, methods: ['GET', 'POST'] },
     pingInterval: 20000,
     pingTimeout: 30000,
-    maxHttpBufferSize: 64 * 1024,          // un SDP/ICE ne dépasse jamais ça
+    maxHttpBufferSize: 400 * 1024,         // messages texte + image JPEG compressée (~300 Ko max)
     perMessageDeflate: { threshold: 1024 }, // compresse seulement les gros paquets
     connectionStateRecovery: { maxDisconnectionDuration: 2 * 60 * 1000 }
 });
@@ -63,7 +64,9 @@ const supprimes = new Map();      // numéros supprimés par l'administrateur (i
 const MSG_SUSPENDU = 'Votre compte a été suspendu par l’administrateur. Contactez-le pour le réactiver.';
 const MSG_SUPPRIME = 'Ce compte a été supprimé par l’administrateur. Vous pouvez vous réinscrire.';
 const messageHistory = [];
-const MAX_HISTORY = 300;
+const MAX_HISTORY = 400;
+const groups = new Map(); // id → { id, nom, membres: string[], createdBy, createdAt }
+const GROUP_MAX_MEMBRES = 30;
 const missedCalls = new Map();   // tel → [{from, at, callType}]
 const activeCalls = new Map();   // tel → { peer, callId, since }
 const failedAttempts = new Map(); // clé → { count, until }
@@ -78,7 +81,7 @@ function loadData() {
                 nom: u.nom, metier: u.metier,
                 pinHash: u.pinHash, pinSalt: u.pinSalt,
                 createdAt: u.createdAt, lastSeen: u.lastSeen || u.createdAt,
-                push: u.push || null, bloque: !!u.bloque, online: false, hidden: false, socketId: null
+                push: u.push || null, bloque: !!u.bloque, adminNote: u.adminNote || '', avertissement: !!u.avertissement, online: false, hidden: false, socketId: null
             });
         });
         (raw.supprimes || []).forEach(([t, ts]) => supprimes.set(t, ts));
@@ -103,7 +106,7 @@ function saveDataNow() {
         for (const [tel, u] of registeredUsers) {
             users.push({
                 tel, nom: u.nom, metier: u.metier, pinHash: u.pinHash,
-                pinSalt: u.pinSalt, createdAt: u.createdAt, lastSeen: u.lastSeen, push: u.push || null, bloque: !!u.bloque
+                pinSalt: u.pinSalt, createdAt: u.createdAt, lastSeen: u.lastSeen, push: u.push || null, bloque: !!u.bloque, adminNote: u.adminNote || '', avertissement: !!u.avertissement
             });
         }
         const tmp = DATA_FILE + '.tmp';
@@ -144,7 +147,7 @@ async function upstash(commande, pipeline) {
 }
 
 function jsonUtilisateur(u) {       // sans « lastSeen » : il change sans cesse et ferait écrire pour rien
-    return JSON.stringify({ nom: u.nom, metier: u.metier, pinHash: u.pinHash, pinSalt: u.pinSalt, createdAt: u.createdAt, push: u.push || null, bloque: !!u.bloque });
+    return JSON.stringify({ nom: u.nom, metier: u.metier, pinHash: u.pinHash, pinSalt: u.pinSalt, createdAt: u.createdAt, push: u.push || null, bloque: !!u.bloque, adminNote: u.adminNote || '', avertissement: !!u.avertissement, statut: normaliserStatut(u.statut) });
 }
 
 async function chargerDepuisUpstash() {
@@ -157,7 +160,7 @@ async function chargerDepuisUpstash() {
                 const u = JSON.parse(plat[i + 1]);
                 registeredUsers.set(plat[i], {
                     nom: u.nom, metier: u.metier, pinHash: u.pinHash, pinSalt: u.pinSalt,
-                    createdAt: u.createdAt, lastSeen: u.createdAt, push: u.push || null, bloque: !!u.bloque,
+                    createdAt: u.createdAt, lastSeen: u.createdAt, push: u.push || null, bloque: !!u.bloque, adminNote: u.adminNote || '', avertissement: !!u.avertissement,
                     online: false, hidden: false, socketId: null
                 });
                 upDerniers.set(plat[i], plat[i + 1]);
@@ -550,8 +553,25 @@ let _initPushFait = false;
 const roomUser = tel => `u:${tel}`;
 const roomWatch = tel => `watch:${tel}`;
 
+const STATUTS_OK = new Set(['disponible', 'occupe', 'deplacement', 'focus', 'invisible']);
+
+function normaliserStatut(s) {
+    const v = String(s || 'disponible').toLowerCase().trim();
+    return STATUTS_OK.has(v) ? v : 'disponible';
+}
+
 function infoPublique(tel, u) {
-    return { telephone: tel, nom: u.nom, metier: u.metier, online: !!u.online, lastSeen: u.lastSeen };
+    const statut = normaliserStatut(u.statut);
+    // invisible : on apparaît hors ligne aux contacts, mais on reste connecté au serveur
+    const visible = !!u.online && !u.hidden && statut !== 'invisible';
+    return {
+        telephone: tel,
+        nom: u.nom,
+        metier: u.metier,
+        online: visible,
+        statut: visible ? statut : (u.online ? 'invisible' : 'hors_ligne'),
+        lastSeen: u.lastSeen || 0
+    };
 }
 
 function compterEnLigne() {
@@ -570,14 +590,11 @@ function emettrePresence(tel) {
 let compteurTimer = null;
 let dernierCompteur = -1;
 function planifierCompteur() {
+    // Plus de diffusion globale du nombre total d’utilisateurs en ligne (vie privée).
     if (compteurTimer) return;
     compteurTimer = setTimeout(() => {
         compteurTimer = null;
-        const n = compterEnLigne();
-        if (n !== dernierCompteur) {
-            dernierCompteur = n;
-            io.emit('online_count', n);
-        }
+        dernierCompteur = compterEnLigne();
     }, 2000);
 }
 
@@ -597,6 +614,7 @@ function lierSocket(socket, tel, user) {
     user.socketId = socket.id;
     user.online = true;
     user.hidden = false;
+    user.statut = normaliserStatut(user.statut || 'disponible');
     user.lastSeen = Date.now();
     socket.telephone = tel;
     socket.join(roomUser(tel));
@@ -798,7 +816,10 @@ io.on('connection', (socket) => {
         if (!nomEstValide(nom)) {
             return ack(cb, { ok: false, error: 'Nom invalide ou réservé (exemples / tests interdits). Entrez VOTRE vrai nom et prénom.' });
         }
-        if (registeredUsers.has(tel) && registeredUsers.get(tel).bloque) return ack(cb, { ok: false, suspendu: true, error: MSG_SUSPENDU });
+        if (registeredUsers.has(tel) && registeredUsers.get(tel).bloque) {
+            noterDemandeReactivation(tel, 'tentative_inscription', { nom: data.nom, metier: data.metier });
+            return ack(cb, { ok: false, suspendu: true, error: MSG_SUSPENDU });
+        }
         if (registeredUsers.has(tel)) {
             return ack(cb, {
                 ok: false, needsRecovery: true,
@@ -837,7 +858,10 @@ io.on('connection', (socket) => {
         }
 
         const user = registeredUsers.get(tel);
-        if (user && user.bloque) return ack(cb, { ok: false, suspendu: true, error: MSG_SUSPENDU });
+        if (user && user.bloque) {
+            noterDemandeReactivation(tel, 'tentative_recuperation', { nom: user.nom, metier: user.metier });
+            return ack(cb, { ok: false, suspendu: true, error: MSG_SUSPENDU });
+        }
         if (!user) { noterEchec(cleIp, 30); return ack(cb, { ok: false, error: 'Aucun compte trouvé pour ce numéro.' }); }
         if (!pinEstCorrect(user, data.recoveryPin)) {
             noterEchec(cleIp, 30); noterEchec(cleTel, 5);
@@ -866,7 +890,10 @@ io.on('connection', (socket) => {
         if (estBloque(cleTel)) return ack(cb, { ok: false, error: 'Trop d’essais. Réessayez plus tard.' });
 
         const existing = registeredUsers.get(tel);
-        if (existing && existing.bloque) return ack(cb, { ok: false, suspendu: true, error: MSG_SUSPENDU });
+        if (existing && existing.bloque) {
+            noterDemandeReactivation(tel, 'tentative_connexion', { nom: existing.nom, metier: existing.metier });
+            return ack(cb, { ok: false, suspendu: true, error: MSG_SUSPENDU });
+        }
         if (!existing && supprimes.has(tel)) return ack(cb, { ok: false, supprime: true, error: MSG_SUPPRIME });
         if (existing) {
             if (pinEstCorrect(existing, data.recoveryPin)) {
@@ -916,7 +943,6 @@ io.on('connection', (socket) => {
             });
         }
         ack(cb, resultats);
-        socket.emit('online_count', compterEnLigne());
     });
 
     socket.on('get_ice', async (_, cb) => {
@@ -1152,42 +1178,98 @@ io.on('connection', (socket) => {
 
     socket.on('visibility', (hidden) => {
         const u = socket.telephone && registeredUsers.get(socket.telephone);
-        if (u) u.hidden = !!hidden;
+        if (u) {
+            u.hidden = !!hidden;
+            emettrePresence(socket.telephone);
+        }
+    });
+
+    // Statut de présence (visible uniquement par ceux qui ont mon numéro en contact)
+    socket.on('set_statut', (data, cb) => {
+        const u = socket.telephone && registeredUsers.get(socket.telephone);
+        if (!u) return ack(cb, { ok: false, error: 'Non connecté.' });
+        u.statut = normaliserStatut(data && data.statut);
+        u.lastSeen = Date.now();
+        emettrePresence(socket.telephone);
+        ack(cb, { ok: true, statut: u.statut });
     });
 
     /* ----- Messagerie ----- */
     socket.on('send_message', (payload, cb) => {
-        if (!socket.telephone || !payload || typeof payload.texte !== 'string') return ack(cb, { ok: false });
-        if (!limiteur(socket, 'msg', 20, 10000)) return ack(cb, { ok: false, error: 'Doucement, trop de messages.' });
-        const texte = payload.texte.trim().slice(0, 1000);
-        if (!texte) return ack(cb, { ok: false });
+        if (!socket.telephone || !payload) return ack(cb, { ok: false });
+        if (!limiteur(socket, 'msg', 25, 10000)) return ack(cb, { ok: false, error: 'Doucement, trop de messages.' });
+        const texte = typeof payload.texte === 'string' ? payload.texte.trim().slice(0, 1000) : '';
+        let image = null;
+        if (typeof payload.image === 'string' && payload.image.startsWith('data:image/')) {
+            // JPEG/WebP compressé côté client — plafond ~280 Ko base64
+            image = payload.image.slice(0, 280000);
+            if (image.length < 32) image = null;
+        }
+        if (!texte && !image) return ack(cb, { ok: false, error: 'Message vide.' });
 
         const me = registeredUsers.get(socket.telephone);
-        const to = payload.to ? nettoyerTel(payload.to) : null;
-        const dest = to ? registeredUsers.get(to) : null;
-        if (to && !dest) return ack(cb, { ok: false, error: 'Ce numéro n’a pas de compte EVAT.' });
-        if (dest && dest.bloque) return ack(cb, { ok: false, error: 'Ce contact est indisponible.' });
+        if (!me) return ack(cb, { ok: false });
+
+        const groupId = payload.groupId ? String(payload.groupId).slice(0, 40) : null;
+        let to = null;
+        let membresCibles = null;
+
+        if (groupId) {
+            const g = groups.get(groupId);
+            if (!g) return ack(cb, { ok: false, error: 'Groupe introuvable.' });
+            if (!g.membres.includes(socket.telephone)) return ack(cb, { ok: false, error: 'Vous n’êtes pas dans ce groupe.' });
+            membresCibles = g.membres.slice();
+        } else {
+            to = payload.to ? nettoyerTel(payload.to) : null;
+            const dest = to ? registeredUsers.get(to) : null;
+            if (to && !dest) return ack(cb, { ok: false, error: 'Ce numéro n’a pas de compte EVAT.' });
+            if (dest && dest.bloque) return ack(cb, { ok: false, error: 'Ce contact est indisponible.' });
+        }
 
         const msg = {
             id: Date.now().toString(36) + crypto.randomBytes(3).toString('hex'),
-            from: socket.telephone,             // imposé par le serveur
+            from: socket.telephone,
             fromName: me.nom,
-            to,
-            texte,
-            heure: new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'UTC' }),   // repli : le téléphone affiche l'heure locale à partir de « timestamp »
+            to: groupId ? null : to,
+            groupId: groupId || null,
+            groupName: groupId && groups.get(groupId) ? groups.get(groupId).nom : null,
+            texte: texte || (image ? '📷 Photo' : ''),
+            image: image || null,
+            heure: new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'UTC' }),
             timestamp: Date.now(),
             cid: String(payload.cid || '').slice(0, 40),
             delivered: false, read: false
         };
 
-        if (to) {
-            if (dest.online) { msg.delivered = true; }
+        const pushBody = image ? '📷 Photo' : (texte.length > 140 ? texte.slice(0, 137) + '…' : texte);
+
+        if (groupId && membresCibles) {
+            let anyOnline = false;
+            messageHistory.push(msg);
+            membresCibles.forEach(tel => {
+                const u = registeredUsers.get(tel);
+                if (u && u.online) anyOnline = true;
+                io.to(roomUser(tel)).emit('new_message', msg);
+                if (tel !== socket.telephone && u && !joignableDirect(u)) {
+                    envoyerPush(tel, {
+                        type: 'message',
+                        title: (msg.groupName || 'Groupe') + ' · ' + me.nom,
+                        body: pushBody,
+                        from: socket.telephone,
+                        tag: 'msg-g-' + groupId
+                    });
+                }
+            });
+            msg.delivered = anyOnline;
+        } else if (to) {
+            const dest = registeredUsers.get(to);
+            if (dest && dest.online) msg.delivered = true;
             messageHistory.push(msg);
             io.to(roomUser(to)).emit('new_message', msg);
             io.to(roomUser(socket.telephone)).emit('new_message', msg);
             if (!joignableDirect(dest)) {
                 envoyerPush(to, {
-                    type: 'message', title: me.nom, body: texte.length > 140 ? texte.slice(0, 137) + '…' : texte,
+                    type: 'message', title: me.nom, body: pushBody,
                     from: socket.telephone, tag: 'msg-' + socket.telephone
                 });
             }
@@ -1198,6 +1280,48 @@ io.on('connection', (socket) => {
         if (messageHistory.length > MAX_HISTORY) messageHistory.shift();
         saveDataSoon();
         ack(cb, { ok: true, id: msg.id, delivered: msg.delivered });
+    });
+
+    /* ----- Groupes légers ----- */
+    socket.on('group_create', (data, cb) => {
+        if (!socket.telephone) return ack(cb, { ok: false, error: 'Non connecté.' });
+        if (!limiteur(socket, 'group_create', 8, 60000)) return ack(cb, { ok: false, error: 'Trop de groupes créés.' });
+        const nom = String((data && data.nom) || '').trim().slice(0, 60);
+        if (!nom) return ack(cb, { ok: false, error: 'Nom du groupe requis.' });
+        let membres = Array.isArray(data && data.membres) ? data.membres.map(t => nettoyerTel(t)).filter(Boolean) : [];
+        membres = [...new Set([socket.telephone, ...membres])].slice(0, GROUP_MAX_MEMBRES);
+        // seulement des comptes EVAT existants
+        membres = membres.filter(t => registeredUsers.has(t) || t === socket.telephone);
+        if (membres.length < 2) return ack(cb, { ok: false, error: 'Ajoutez au moins 1 contact inscrit sur EVAT.' });
+        const id = 'g' + Date.now().toString(36) + crypto.randomBytes(2).toString('hex');
+        const g = { id, nom, membres, createdBy: socket.telephone, createdAt: Date.now() };
+        groups.set(id, g);
+        membres.forEach(tel => {
+            io.to(roomUser(tel)).emit('group_update', { action: 'create', group: g });
+        });
+        ack(cb, { ok: true, group: g });
+    });
+
+    socket.on('group_list', (data, cb) => {
+        if (!socket.telephone) return ack(cb, { ok: false, groups: [] });
+        const mine = [];
+        for (const g of groups.values()) {
+            if (g.membres.includes(socket.telephone)) mine.push(g);
+        }
+        ack(cb, { ok: true, groups: mine });
+    });
+
+    socket.on('group_leave', (data, cb) => {
+        if (!socket.telephone) return ack(cb, { ok: false });
+        const id = data && data.id;
+        const g = groups.get(id);
+        if (!g) return ack(cb, { ok: false, error: 'Groupe introuvable.' });
+        g.membres = g.membres.filter(t => t !== socket.telephone);
+        if (g.membres.length === 0) groups.delete(id);
+        else {
+            g.membres.forEach(tel => io.to(roomUser(tel)).emit('group_update', { action: 'leave', group: g, who: socket.telephone }));
+        }
+        ack(cb, { ok: true });
     });
 
     // « J'ai lu la conversation avec X » → coche bleue chez X
@@ -1220,6 +1344,63 @@ io.on('connection', (socket) => {
         if (!socket.telephone || !data || !data.to) return;
         if (!limiteur(socket, 'typing', 40, 10000)) return;
         io.to(roomUser(nettoyerTel(data.to))).emit('typing', { from: socket.telephone, on: !!data.on });
+    });
+
+    /* ----- Sauvegarde cloud des contacts (liés au numéro de compte) ----- */
+    socket.on('contacts_backup', async (payload, cb) => {
+        if (!socket.telephone) return ack(cb, { ok: false, error: 'Non connecté.' });
+        if (!limiteur(socket, 'contacts_backup', 6, 60000)) return ack(cb, { ok: false, error: 'Trop de sauvegardes. Patientez.' });
+        const liste = Array.isArray(payload) ? payload : (payload && payload.contacts);
+        if (!Array.isArray(liste)) return ack(cb, { ok: false, error: 'Format invalide.' });
+        // Limite taille : max 500 contacts, champs tronqués
+        const clean = liste.slice(0, 500).map(c => {
+            if (!c || typeof c !== 'object') return null;
+            const tel = nettoyerTel(c.telephone || c.tel || '');
+            if (!tel) return null;
+            return {
+                nom: String(c.nom || '').slice(0, 80),
+                telephone: tel,
+                telephones: Array.isArray(c.telephones) ? c.telephones.slice(0, 5).map(t => nettoyerTel(t)).filter(Boolean) : undefined,
+                email: String(c.email || '').slice(0, 120),
+                emails: Array.isArray(c.emails) ? c.emails.slice(0, 5).map(e => String(e).slice(0, 120)) : undefined,
+                metier: String(c.metier || '').slice(0, 80),
+                entreprise: String(c.entreprise || '').slice(0, 80),
+                adresse: String(c.adresse || '').slice(0, 160),
+                notes: String(c.notes || '').slice(0, 400)
+            };
+        }).filter(Boolean);
+        const blob = JSON.stringify({ at: Date.now(), contacts: clean });
+        if (blob.length > 800000) return ack(cb, { ok: false, error: 'Annuaire trop volumineux.' });
+        try {
+            if (upstashActif) {
+                await upstash(['HSET', 'evat:contacts', socket.telephone, blob]);
+            }
+            // aussi en mémoire légère (process)
+            const u = registeredUsers.get(socket.telephone);
+            if (u) u.contactsBackup = blob;
+            ack(cb, { ok: true, n: clean.length });
+        } catch (e) {
+            ack(cb, { ok: false, error: e.message || 'Sauvegarde impossible' });
+        }
+    });
+
+    socket.on('contacts_restore', async (data, cb) => {
+        if (!socket.telephone) return ack(cb, { ok: false, error: 'Non connecté.' });
+        if (!limiteur(socket, 'contacts_restore', 10, 60000)) return ack(cb, { ok: false, error: 'Trop de requêtes.' });
+        try {
+            let blob = null;
+            const u = registeredUsers.get(socket.telephone);
+            if (u && u.contactsBackup) blob = u.contactsBackup;
+            if (!blob && upstashActif) {
+                blob = await upstash(['HGET', 'evat:contacts', socket.telephone]);
+                if (u && blob) u.contactsBackup = blob;
+            }
+            if (!blob) return ack(cb, { ok: true, contacts: [], at: 0 });
+            const parsed = typeof blob === 'string' ? JSON.parse(blob) : blob;
+            ack(cb, { ok: true, contacts: parsed.contacts || [], at: parsed.at || 0 });
+        } catch (e) {
+            ack(cb, { ok: false, error: e.message || 'Restauration impossible' });
+        }
     });
 
     // Historique : diffusions + MES conversations privées seulement
@@ -1302,9 +1483,12 @@ setInterval(() => {
 
 /* ---------------- HTTP ---------------- */
 
-/* ---------------- Administration : voir, bloquer, supprimer, redonner un code ---------------- */
+/* ---------------- Administration : voir, bloquer, supprimer, redonner un code, alertes, demandes ---------------- */
 const adminIp = new Map();
-const adminJournal = [];       // dernières actions (en mémoire)
+const adminJournal = [];
+const adminDemandes = [];
+const ADMIN_DEMANDES_MAX = 80;
+const ADMIN_JOURNAL_MAX = 80;
 
 function controleAdmin(req, res, donne) {
     const admin = process.env.ADMIN_TOKEN || '';
@@ -1329,18 +1513,43 @@ function controleAdmin(req, res, donne) {
 }
 const jetonDe = req => { const h = String((req.headers && req.headers.authorization) || ''); return /^Bearer /i.test(h) ? h.slice(7).trim() : ''; };
 
+function journalAdmin(action, tel, extra) {
+    adminJournal.unshift(Object.assign({ t: Date.now(), action, tel: tel ? masque(tel) : '—' }, extra || {}));
+    adminJournal.length = Math.min(adminJournal.length, ADMIN_JOURNAL_MAX);
+    console.log(`[ADMIN] ${action}${tel ? ' ' + masque(tel) : ''}${extra && extra.detail ? ' — ' + extra.detail : ''}`);
+}
+
+function noterDemandeReactivation(tel, motif, meta) {
+    const u = registeredUsers.get(tel);
+    const nom = (u && u.nom) || (meta && meta.nom) || '—';
+    const metier = (u && u.metier) || (meta && meta.metier) || '';
+    const recent = adminDemandes.find(d => d.tel === tel && Date.now() - d.t < 10 * 60 * 1000);
+    if (recent) {
+        recent.tentatives = (recent.tentatives || 1) + 1;
+        recent.t = Date.now();
+        recent.motif = motif || recent.motif;
+        return recent;
+    }
+    const d = { id: crypto.randomBytes(6).toString('hex'), t: Date.now(), tel, nom, metier, motif: motif || 'connexion', tentatives: 1, traite: false };
+    adminDemandes.unshift(d);
+    adminDemandes.length = Math.min(adminDemandes.length, ADMIN_DEMANDES_MAX);
+    journalAdmin('demande_reactivation', tel, { detail: motif || 'connexion' });
+    return d;
+}
+
 function listeAdmin() {
     const out = [];
     for (const [tel, u] of registeredUsers) {
         out.push({
             tel, nom: u.nom, metier: u.metier, enLigne: !!u.online, push: !!u.push, bloque: !!u.bloque,
-            creeLe: u.createdAt || 0, vuLe: u.online ? Date.now() : (u.lastSeen && u.lastSeen > (u.createdAt || 0) ? u.lastSeen : 0)
+            note: u.adminNote || '', avertissement: !!u.avertissement,
+            creeLe: u.createdAt || 0,
+            vuLe: u.online ? Date.now() : (u.lastSeen && u.lastSeen > (u.createdAt || 0) ? u.lastSeen : 0)
         });
     }
     return out.sort((a, b) => b.creeLe - a.creeLe);
 }
 
-/** Coupe proprement un compte connecté (blocage ou suppression) : appel en cours, sonnerie, session */
 function couperCompte(tel, raison, message) {
     const u = registeredUsers.get(tel);
     if (!u) return;
@@ -1356,113 +1565,96 @@ function couperCompte(tel, raison, message) {
     emettrePresence(tel);
 }
 
-function actionAdmin(action, tel) {
+async function envoyerMessageAdmin(tel, titre, corps) {
+    const u = registeredUsers.get(tel);
+    if (!u) return { ok: false, error: 'Compte introuvable.' };
+    const payload = { type: 'admin', title: String(titre || 'Message EVAT').slice(0, 80), body: String(corps || '').slice(0, 400), tag: 'evat-admin-' + Date.now() };
+    let socketOk = false, pushOk = false;
+    const sock = u.socketId && io.sockets.sockets.get(u.socketId);
+    if (sock) { sock.emit('admin_message', { title: payload.title, body: payload.body, at: Date.now() }); socketOk = true; }
+    pushOk = !!(await envoyerPush(tel, payload));
+    return { ok: true, socketOk, pushOk };
+}
+
+async function actionAdmin(action, tel, extra) {
+    extra = extra || {};
+    if (action === 'alerte_tous') {
+        const titre = String(extra.titre || 'Alerte EVAT').slice(0, 80);
+        const corps = String(extra.corps || '').trim().slice(0, 400);
+        if (!corps) return { ok: false, error: 'Message vide.' };
+        let nSock = 0, nPush = 0;
+        for (const [t] of registeredUsers) {
+            const r = await envoyerMessageAdmin(t, titre, corps);
+            if (r.socketOk) nSock++;
+            if (r.pushOk) nPush++;
+        }
+        journalAdmin('alerte_tous', null, { detail: nSock + ' en ligne, ' + nPush + ' push' });
+        return { ok: true, nSock, nPush };
+    }
+    if (action === 'marquer_demande') {
+        const id = String(extra.id || '');
+        const d = adminDemandes.find(x => x.id === id);
+        if (!d) return { ok: false, error: 'Demande introuvable.' };
+        d.traite = true;
+        journalAdmin('demande_traitee', d.tel);
+        return { ok: true };
+    }
     const u = registeredUsers.get(tel);
     if (!u) return { ok: false, error: 'Compte introuvable.' };
     if (action === 'bloquer') {
-        u.bloque = true;
+        u.bloque = true; u.avertissement = false;
         couperCompte(tel, 'blocked', MSG_SUSPENDU);
     } else if (action === 'debloquer') {
-        u.bloque = false;
+        u.bloque = false; u.avertissement = false;
+        adminDemandes.forEach(d => { if (d.tel === tel) d.traite = true; });
+        envoyerMessageAdmin(tel, '✅ Compte réactivé', 'Votre compte EVAT a été réactivé par l’administrateur. Vous pouvez vous reconnecter.');
     } else if (action === 'supprimer') {
         couperCompte(tel, 'deleted', MSG_SUPPRIME);
-        registeredUsers.delete(tel);
-        upDerniers.delete(tel);
+        registeredUsers.delete(tel); upDerniers.delete(tel);
         for (let i = messageHistory.length - 1; i >= 0; i--) if (messageHistory[i].from === tel || messageHistory[i].to === tel) messageHistory.splice(i, 1);
-        missedCalls.delete(tel);
-        supprimes.set(tel, Date.now());
+        missedCalls.delete(tel); supprimes.set(tel, Date.now());
         upFile.push(['HDEL', 'evat:users', tel], ['HSET', 'evat:supprimes', tel, String(Date.now())]);
+        adminDemandes.forEach(d => { if (d.tel === tel) d.traite = true; });
     } else if (action === 'nouveau_code') {
         const pin = genererPin();
         Object.assign(u, hashPin(pin));
         effacerEchecs('tel:' + tel);
-        adminJournal.unshift({ t: Date.now(), action, tel: masque(tel) }); adminJournal.length = Math.min(adminJournal.length, 50);
-        console.log(`[ADMIN] ${action} ${masque(tel)}`);
-        saveDataSoon();
+        journalAdmin(action, tel); saveDataSoon();
         return { ok: true, code: pin };
+    } else if (action === 'message') {
+        const titre = String(extra.titre || 'Message de l’administrateur').slice(0, 80);
+        const corps = String(extra.corps || '').trim().slice(0, 400);
+        if (!corps) return { ok: false, error: 'Message vide.' };
+        const r = await envoyerMessageAdmin(tel, titre, corps);
+        if (!r.ok) return r;
+        journalAdmin('message', tel, { detail: titre }); saveDataSoon();
+        return { ok: true, socketOk: r.socketOk, pushOk: r.pushOk };
+    } else if (action === 'avertir') {
+        u.avertissement = true;
+        const corps = String(extra.corps || 'Votre compte a reçu un avertissement de l’administrateur EVAT. Merci de respecter les règles d’usage.').slice(0, 400);
+        await envoyerMessageAdmin(tel, '⚠️ Avertissement EVAT', corps);
+        journalAdmin('avertir', tel);
+    } else if (action === 'note') {
+        u.adminNote = String(extra.note || '').trim().slice(0, 300);
+        journalAdmin('note', tel);
+    } else if (action === 'renommer') {
+        const nom = String(extra.nom || '').trim().slice(0, 80);
+        if (!nomEstValide(nom)) return { ok: false, error: 'Nom invalide.' };
+        u.nom = nom; journalAdmin('renommer', tel, { detail: nom });
+    } else if (action === 'metier') {
+        u.metier = String(extra.metier || 'Opérateur').trim().slice(0, 80);
+        journalAdmin('metier', tel, { detail: u.metier });
+    } else if (action === 'reset_pin_essais') {
+        effacerEchecs('tel:' + tel); journalAdmin('reset_pin_essais', tel); return { ok: true };
+    } else if (action === 'deconnecter') {
+        couperCompte(tel, 'admin', 'Vous avez été déconnecté par l’administrateur.');
+        journalAdmin('deconnecter', tel); return { ok: true };
     } else return { ok: false, error: 'Action inconnue.' };
-    adminJournal.unshift({ t: Date.now(), action, tel: masque(tel) }); adminJournal.length = Math.min(adminJournal.length, 50);
-    console.log(`[ADMIN] ${action} ${masque(tel)}`);
-    saveDataNow();
-    saveDataSoon();
+    journalAdmin(action, tel); saveDataNow(); saveDataSoon();
     return { ok: true };
 }
 
-const PAGE_ADMIN = `<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Administration EVAT</title>
-<style>
-*{box-sizing:border-box}body{font-family:system-ui,sans-serif;background:#050b1a;color:#eaf4ff;margin:0;padding:14px;max-width:760px;margin:auto}
-h1{font-size:20px;margin:6px 0 12px}.stats{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}.stat{background:#0b1630;border:1px solid #1e3a6e;border-radius:12px;padding:8px 12px;font-size:13px}.stat b{display:block;font-size:20px}
-input{width:100%;padding:11px 14px;border-radius:12px;border:1px solid #1e3a6e;background:#050c1e;color:#eaf4ff;font-size:15px;margin-bottom:10px}
-.u{background:#0b1630;border:1px solid #1e3a6e;border-radius:14px;padding:12px;margin:8px 0}.u.bloque{border-color:#ef4444;background:#1a0b12}
-.u strong{font-size:15px}.u small{display:block;color:#9fb4d3;margin-top:3px}.tags{margin:6px 0}.tag{display:inline-block;font-size:11px;padding:2px 8px;border-radius:10px;margin-right:5px;background:#12306a}
-.ok{background:#064e3b}.ko{background:#7f1d1d}.btns{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
-button{border:0;border-radius:10px;padding:9px 12px;font-size:13px;color:#fff;background:#2563eb;cursor:pointer}button.r{background:#dc2626}button.v{background:#059669}button.o{background:#d97706}
-.err{color:#fca5a5}#modal{position:fixed;inset:0;background:rgba(0,0,0,.85);display:none;align-items:center;justify-content:center;padding:20px}#modal div{background:#0b1630;border:1px solid #22d3ee;border-radius:16px;padding:22px;max-width:360px;text-align:center}
-#code{font-size:38px;letter-spacing:6px;font-weight:800;color:#22d3ee;margin:12px 0}.petit{color:#7589a8;font-size:12px;margin-top:16px}
-</style></head><body>
-<h1>🛡️ Administration EVAT</h1>
-<div class="stats" id="stats"></div>
-<input id="q" type="search" placeholder="Rechercher un nom, un numéro ou un métier…">
-<div id="liste">Chargement…</div>
-<p class="petit" id="journal"></p>
-<div id="modal"><div><strong>Nouveau code de récupération</strong><div id="code"></div>
-<p style="font-size:13px;color:#9fb4d3">Donnez ce code à l’utilisateur (par téléphone ou message). Dans EVAT : <em>Récupérer mon compte</em> → son numéro + ce code. L’ancien code ne marche plus. Ce code ne sera plus affiché.</p>
-<button id="fermer">J’ai noté le code</button></div></div>
-<script>
-(function(){
-  var token = new URLSearchParams(location.search).get('token') || '';
-  var users = [];
-  function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); }
-  function api(path, opts){
-    opts = opts || {};
-    opts.headers = {'Authorization':'Bearer '+token,'Content-Type':'application/json'};
-    return fetch(path, opts).then(function(r){ if(r.status===403) throw new Error('Accès refusé'); if(r.status===429) throw new Error('Trop d essais, patientez'); if(!r.ok) throw new Error('Erreur '+r.status); return r.json(); });
-  }
-  function date(t){ return t ? new Date(t).toLocaleString('fr-FR',{dateStyle:'short',timeStyle:'short'}) : 'inconnue'; }
-  function rendre(){
-    var q = document.getElementById('q').value.trim().toLowerCase();
-    var l = users.filter(function(u){ return !q || (u.nom+' '+u.tel+' '+u.metier).toLowerCase().indexOf(q) >= 0; });
-    document.getElementById('liste').innerHTML = l.length ? l.map(function(u){
-      return '<div class="u'+(u.bloque?' bloque':'')+'"><strong>'+esc(u.nom)+'</strong><small>'+esc(u.tel)+' · '+esc(u.metier)+'</small>'+
-        '<div class="tags"><span class="tag '+(u.enLigne?'ok':'')+'">'+(u.enLigne?'🟢 en ligne':'⚪ hors ligne')+'</span>'+
-        '<span class="tag '+(u.push?'ok':'')+'">'+(u.push?'🔔 notifications':'🔕 sans notifications')+'</span>'+
-        (u.bloque?'<span class="tag ko">⛔ bloqué</span>':'')+'</div>'+
-        '<small>Inscrit : '+date(u.creeLe)+' · Vu : '+(u.enLigne?'maintenant':date(u.vuLe))+'</small>'+
-        '<div class="btns"><button class="o" data-a="nouveau_code" data-t="'+esc(u.tel)+'">🔑 Nouveau code</button>'+
-        (u.bloque?'<button class="v" data-a="debloquer" data-t="'+esc(u.tel)+'">✅ Débloquer</button>':'<button class="r" data-a="bloquer" data-t="'+esc(u.tel)+'">⛔ Bloquer</button>')+
-        '<button class="r" data-a="supprimer" data-t="'+esc(u.tel)+'">🗑️ Supprimer</button></div></div>';
-    }).join('') : '<p>Aucun compte.</p>';
-  }
-  function charger(){
-    api('/admin/api/users').then(function(d){
-      users = d.users;
-      document.getElementById('stats').innerHTML =
-        '<div class="stat"><b>'+d.stats.total+'</b>comptes</div><div class="stat"><b>'+d.stats.enLigne+'</b>en ligne</div>'+
-        '<div class="stat"><b>'+d.stats.bloques+'</b>bloqués</div><div class="stat"><b>'+d.stats.push+'</b>avec notifications</div>';
-      document.getElementById('journal').textContent = d.journal.length ? 'Dernières actions : ' + d.journal.slice(0,6).map(function(j){ return j.action+' '+j.tel; }).join(' · ') : '';
-      rendre();
-    }).catch(function(e){ document.getElementById('liste').innerHTML = '<p class="err">'+esc(e.message)+'</p>'; });
-  }
-  document.getElementById('q').addEventListener('input', rendre);
-  document.getElementById('fermer').addEventListener('click', function(){ document.getElementById('modal').style.display='none'; });
-  document.addEventListener('click', function(e){
-    var b = e.target.closest ? e.target.closest('[data-a]') : null; if(!b) return;
-    var a = b.getAttribute('data-a'), t = b.getAttribute('data-t');
-    var u = users.filter(function(x){ return x.tel===t; })[0] || {nom:t};
-    var q = {bloquer:'Bloquer le compte de '+u.nom+' ? Il sera déconnecté et ne pourra plus appeler ni être appelé.',
-             debloquer:'Débloquer le compte de '+u.nom+' ?',
-             supprimer:'SUPPRIMER définitivement le compte de '+u.nom+' et ses messages ? Cette action est irréversible.',
-             nouveau_code:'Générer un nouveau code de récupération pour '+u.nom+' ? L’ancien code ne marchera plus.'}[a];
-    if(!confirm(q)) return;
-    api('/admin/api/action',{method:'POST',body:JSON.stringify({action:a,tel:t})}).then(function(r){
-      if(!r.ok){ alert(r.error||'Échec'); return; }
-      if(r.code){ document.getElementById('code').textContent = r.code; document.getElementById('modal').style.display='flex'; }
-      charger();
-    }).catch(function(err){ alert(err.message); });
-  });
-  charger(); setInterval(charger, 30000);
-})();
-</script></body></html>`;
+const PAGE_ADMIN = require('fs').readFileSync(require('path').join(__dirname, 'admin.html'), 'utf8');
 
 app.get('/admin', (req, res) => {
     if (!controleAdmin(req, res, req.query.token)) return;
@@ -1471,18 +1663,31 @@ app.get('/admin', (req, res) => {
 app.get('/admin/api/users', (req, res) => {
     if (!controleAdmin(req, res, jetonDe(req))) return;
     const users = listeAdmin();
+    const demandesActives = adminDemandes.filter(d => !d.traite).length;
     res.json({
         users,
-        stats: { total: users.length, enLigne: users.filter(u => u.enLigne).length, bloques: users.filter(u => u.bloque).length, push: users.filter(u => u.push).length },
+        demandes: adminDemandes.slice(0, 40),
+        stats: {
+            total: users.length,
+            enLigne: users.filter(u => u.enLigne).length,
+            bloques: users.filter(u => u.bloque).length,
+            push: users.filter(u => u.push).length,
+            demandes: demandesActives
+        },
         journal: adminJournal
     });
 });
-app.post('/admin/api/action', (req, res) => {
+app.post('/admin/api/action', async (req, res) => {
     if (!controleAdmin(req, res, jetonDe(req))) return;
     const b = req.body || {};
-    const tel = nettoyerTel(b.tel);
-    res.json(actionAdmin(String(b.action || ''), tel));
+    const tel = b.tel ? nettoyerTel(b.tel) : '';
+    try {
+        res.json(await actionAdmin(String(b.action || ''), tel, b));
+    } catch (e) {
+        res.json({ ok: false, error: e.message || 'Erreur serveur' });
+    }
 });
+
 
 /* ---------------- Page de diagnostic (pour activer les services pas à pas) ---------------- */
 const diagIp = new Map();
