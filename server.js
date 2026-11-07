@@ -50,7 +50,7 @@ const io = new Server(server, {
     cors: { origin: corsOrigin, methods: ['GET', 'POST'] },
     pingInterval: 20000,
     pingTimeout: 30000,
-    maxHttpBufferSize: 400 * 1024,         // messages texte + image JPEG compressée (~300 Ko max)
+    maxHttpBufferSize: 600 * 1024,         // texte + image + message vocal compressé
     perMessageDeflate: { threshold: 1024 }, // compresse seulement les gros paquets
     connectionStateRecovery: { maxDisconnectionDuration: 2 * 60 * 1000 }
 });
@@ -1201,11 +1201,17 @@ io.on('connection', (socket) => {
         const texte = typeof payload.texte === 'string' ? payload.texte.trim().slice(0, 1000) : '';
         let image = null;
         if (typeof payload.image === 'string' && payload.image.startsWith('data:image/')) {
-            // JPEG/WebP compressé côté client — plafond ~280 Ko base64
             image = payload.image.slice(0, 280000);
             if (image.length < 32) image = null;
         }
-        if (!texte && !image) return ack(cb, { ok: false, error: 'Message vide.' });
+        let audio = null;
+        if (typeof payload.audio === 'string' && payload.audio.startsWith('data:audio/')) {
+            // Message vocal compressé (webm/opus ou ogg) — plafond ~350 Ko base64 (~45–60 s)
+            audio = payload.audio.slice(0, 350000);
+            if (audio.length < 32) audio = null;
+        }
+        const audioDur = Math.min(120, Math.max(0, parseInt(payload.audioDur, 10) || 0));
+        if (!texte && !image && !audio) return ack(cb, { ok: false, error: 'Message vide.' });
 
         const me = registeredUsers.get(socket.telephone);
         if (!me) return ack(cb, { ok: false });
@@ -1233,15 +1239,17 @@ io.on('connection', (socket) => {
             to: groupId ? null : to,
             groupId: groupId || null,
             groupName: groupId && groups.get(groupId) ? groups.get(groupId).nom : null,
-            texte: texte || (image ? '📷 Photo' : ''),
+            texte: texte || (audio ? '🎤 Message vocal' : (image ? '📷 Photo' : '')),
             image: image || null,
+            audio: audio || null,
+            audioDur: audio ? audioDur : 0,
             heure: new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'UTC' }),
             timestamp: Date.now(),
             cid: String(payload.cid || '').slice(0, 40),
             delivered: false, read: false
         };
 
-        const pushBody = image ? '📷 Photo' : (texte.length > 140 ? texte.slice(0, 137) + '…' : texte);
+        const pushBody = audio ? '🎤 Message vocal' : (image ? '📷 Photo' : (texte.length > 140 ? texte.slice(0, 137) + '…' : texte));
 
         if (groupId && membresCibles) {
             let anyOnline = false;
