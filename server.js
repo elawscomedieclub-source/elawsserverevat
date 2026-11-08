@@ -72,6 +72,45 @@ const activeCalls = new Map();   // tel → { peer, callId, since }
 const failedAttempts = new Map(); // clé → { count, until }
 const pendingCalls = new Map();  // tel du destinataire → { callId, from, signals[], expires, acked }
 let vapid = null;                // { publicKey, privateKey }
+// Numéros que des utilisateurs ont en contact mais qui n'ont pas encore de compte :
+// à l'inscription de ce numéro, ceux qui l'ont en contact reçoivent « votre contact vient de s'inscrire ».
+const attenteInscription = new Map();         // numéro non inscrit → Set des propriétaires du contact
+const attenteParProprietaire = new Map();     // propriétaire → Set des numéros non inscrits qu'il a en contact
+const inscriptionsEnAttente = new Map();      // propriétaire hors ligne → [{ nom, telephone, metier, at }]
+const MAX_ATTENTE_NUMEROS = 100000, MAX_PROPRIO_PAR_NUMERO = 300;
+
+function ajouterAttente(proprio, tel) {
+    let s1 = attenteInscription.get(tel);
+    if (!s1) {
+        if (attenteInscription.size >= MAX_ATTENTE_NUMEROS) return;
+        s1 = new Set(); attenteInscription.set(tel, s1);
+    }
+    if (s1.size >= MAX_PROPRIO_PAR_NUMERO && !s1.has(proprio)) return;
+    s1.add(proprio);
+    let s2 = attenteParProprietaire.get(proprio);
+    if (!s2) { s2 = new Set(); attenteParProprietaire.set(proprio, s2); }
+    s2.add(tel);
+}
+function retirerAttente(proprio, tel) {
+    const s1 = attenteInscription.get(tel);
+    if (s1) { s1.delete(proprio); if (!s1.size) attenteInscription.delete(tel); }
+    const s2 = attenteParProprietaire.get(proprio);
+    if (s2) { s2.delete(tel); if (!s2.size) attenteParProprietaire.delete(proprio); }
+}
+/** Met à jour la liste des contacts non inscrits d'un utilisateur ; renvoie true si quelque chose a changé */
+function majAttenteProprietaire(proprio, nonInscrits) {
+    const ancien = new Set(attenteParProprietaire.get(proprio) || []);
+    let change = false;
+    ancien.forEach(t => { if (!nonInscrits.has(t)) { retirerAttente(proprio, t); change = true; } });
+    nonInscrits.forEach(t => { if (!ancien.has(t)) { ajouterAttente(proprio, t); change = true; } });
+    return change;
+}
+const attenteVersJson = () => JSON.stringify([...attenteInscription].map(([t, set]) => [t, [...set]]));
+function attenteDepuisJson(txt) {
+    try {
+        JSON.parse(txt).forEach(([t, liste]) => (liste || []).forEach(o => ajouterAttente(String(o), String(t))));
+    } catch (e) { /* illisible : ignoré */ }
+}
 
 function loadData() {
     try {
@@ -87,6 +126,7 @@ function loadData() {
         (raw.supprimes || []).forEach(([t, ts]) => supprimes.set(t, ts));
         (raw.messages || []).forEach(m => messageHistory.push(m));
         if (raw.vapid && raw.vapid.publicKey) vapid = raw.vapid;
+        if (Array.isArray(raw.attente)) raw.attente.forEach(([t, liste]) => (liste || []).forEach(o => ajouterAttente(String(o), String(t))));
         console.log(`💾 ${registeredUsers.size} comptes chargés`);
     } catch (e) { /* premier démarrage */ }
 }
@@ -110,7 +150,7 @@ function saveDataNow() {
             });
         }
         const tmp = DATA_FILE + '.tmp';
-        fs.writeFileSync(tmp, JSON.stringify({ users, supprimes: [...supprimes], vapid, messages: messageHistory.slice(-MAX_HISTORY) }));
+        fs.writeFileSync(tmp, JSON.stringify({ users, supprimes: [...supprimes], vapid, messages: messageHistory.slice(-MAX_HISTORY), attente: [...attenteInscription].map(([t, set]) => [t, [...set]]) }));
         fs.renameSync(tmp, DATA_FILE);
     } catch (e) {
         console.warn('Sauvegarde impossible :', e.message);
@@ -132,7 +172,7 @@ const upstashActif = !!(UP_URL && UP_TOKEN);
 const upUrlValide = (() => { try { return new URL(UP_URL).protocol === 'https:'; } catch (e) { return false; } })();
 const upFile = [];      // commandes en attente (suppressions de comptes)
 const upDerniers = new Map();      // tel -> dernier JSON enregistré (on n'écrit que ce qui change)
-let upMessagesJson = '', upMessagesT = 0, upTimer = null, upEtat = { ok: null, erreur: '', comptes: 0 };
+let upAttenteJson = '', upMessagesJson = '', upMessagesT = 0, upTimer = null, upEtat = { ok: null, erreur: '', comptes: 0 };
 
 async function upstash(commande, pipeline) {
     const r = await fetch(UP_URL + (pipeline ? '/pipeline' : ''), {
@@ -173,6 +213,11 @@ async function chargerDepuisUpstash() {
         if (msgs) {
             try { JSON.parse(msgs).forEach(m => messageHistory.push(m)); upMessagesJson = msgs; } catch (e) {}
         }
+        // Contacts en attente d'inscription
+        try {
+            const att = await upstash(['GET', 'evat:attente']);
+            if (att) { attenteDepuisJson(att); upAttenteJson = attenteVersJson(); }
+        } catch (e) { console.warn('[Upstash] attente :', e.message); }
         // Groupes persistants
         try {
             const gplat = await upstash(['HGETALL', 'evat:groups']);
@@ -222,6 +267,8 @@ async function upstashEnvoyer() {
         const mj = JSON.stringify(messageHistory.slice(-MAX_HISTORY));
         if (mj !== upMessagesJson) { cmds.push(['SET', 'evat:messages', mj]); suites.push(() => { upMessagesJson = mj; upMessagesT = Date.now(); }); }
     }
+    const aj = attenteVersJson();
+    if (aj !== upAttenteJson) { cmds.push(['SET', 'evat:attente', aj]); suites.push(() => { upAttenteJson = aj; }); }
     if (!cmds.length) return;
     try {
         const res = await upstash(cmds, true);
@@ -464,8 +511,63 @@ function initialiserPush() {
     webpush.setVapidDetails(process.env.VAPID_SUBJECT || 'mailto:contact@evat.app', vapid.publicKey, vapid.privateKey);
 }
 
+/* ---------- Notifications de l'appli native Android (Firebase Cloud Messaging) ----------
+   Variable Render : FIREBASE_SERVICE_ACCOUNT = contenu complet du fichier JSON « compte de service » de Firebase.
+   Sans elle, l'appli native fonctionne mais ne reçoit pas les appels quand elle est fermée. */
+const FCM_JSON = (() => {
+    try {
+        const j = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '');
+        return (j && j.private_key && j.client_email && j.project_id) ? j : null;
+    } catch (e) { return null; }
+})();
+const fcmActif = !!FCM_JSON;
+let fcmJeton = { valeur: '', exp: 0 };
+const b64u = b => Buffer.from(b).toString('base64url');
+
+async function fcmAccessToken() {
+    if (fcmJeton.valeur && fcmJeton.exp > Date.now() + 60000) return fcmJeton.valeur;
+    const now = Math.floor(Date.now() / 1000);
+    const entete = b64u(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+    const corps = b64u(JSON.stringify({
+        iss: FCM_JSON.client_email, scope: 'https://www.googleapis.com/auth/firebase.messaging',
+        aud: 'https://oauth2.googleapis.com/token', iat: now, exp: now + 3600
+    }));
+    const signature = crypto.createSign('RSA-SHA256').update(entete + '.' + corps).sign(FCM_JSON.private_key).toString('base64url');
+    const r = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: 'grant_type=' + encodeURIComponent('urn:ietf:params:oauth:grant-type:jwt-bearer') + '&assertion=' + entete + '.' + corps + '.' + signature
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.access_token) throw new Error('FCM authentification ' + r.status);
+    fcmJeton = { valeur: j.access_token, exp: Date.now() + (j.expires_in || 3600) * 1000 };
+    return fcmJeton.valeur;
+}
+
+async function envoyerFcm(u, payload) {
+    if (!FCM_JSON || !u || !u.push || !u.push.fcm) return false;
+    try {
+        const jeton = await fcmAccessToken();
+        const appel = payload.type === 'call' || payload.type === 'test';
+        const data = {};
+        ['type', 'from', 'callId', 'tag'].forEach(k => { if (payload[k] !== undefined && payload[k] !== null) data[k] = String(payload[k]); });
+        const notification = { title: payload.title || 'EVAT', body: payload.body || '', channel_id: appel ? 'appels' : 'messages', sound: 'default' };
+        if (payload.tag) notification.tag = String(payload.tag);
+        const r = await fetch('https://fcm.googleapis.com/v1/projects/' + FCM_JSON.project_id + '/messages:send', {
+            method: 'POST',
+            headers: { Authorization: 'Bearer ' + jeton, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message: { token: u.push.fcm, data, android: { priority: 'HIGH', ttl: appel ? '30s' : '3600s', notification } } })
+        });
+        if (r.ok) return true;
+        const txt = await r.text().catch(() => '');
+        if (r.status === 404 || /UNREGISTERED/.test(txt)) { u.push = null; saveDataSoon(); }   // appli désinstallée
+        else console.warn('[FCM]', r.status, txt.slice(0, 200));
+        return false;
+    } catch (e) { console.warn('[FCM]', e.message); return false; }
+}
+
 async function envoyerPush(tel, payload) {
     const u = registeredUsers.get(tel);
+    if (u && u.push && u.push.fcm) return envoyerFcm(u, payload);   // appli native
     if (!webpush || !vapid || !u || !u.push) return false;
     try {
         await webpush.sendNotification(u.push, JSON.stringify(payload), {
@@ -574,6 +676,36 @@ let _initPushFait = false;
 const roomUser = tel => `u:${tel}`;
 const roomWatch = tel => `watch:${tel}`;
 
+/** Un nouveau numéro vient de s'inscrire : tous ceux qui l'ont en contact sont prévenus (comme WhatsApp / Telegram) */
+function prevenirContactsInscription(tel, nom, metier) {
+    const proprios = attenteInscription.get(tel);
+    if (!proprios) return;
+    attenteInscription.delete(tel);
+    const info = { nom, telephone: tel, metier, at: Date.now() };
+    proprios.forEach(o => {
+        const set = attenteParProprietaire.get(o);
+        if (set) { set.delete(tel); if (!set.size) attenteParProprietaire.delete(o); }
+        const owner = registeredUsers.get(o);
+        if (!owner || o === tel) return;
+        // il suivra désormais la présence de ce nouveau contact
+        try { io.in(roomUser(o)).socketsJoin(roomWatch(tel)); } catch (e) {}
+        if (owner.online) io.to(roomUser(o)).emit('contacts_joined', [info]);
+        if (!joignableDirect(owner)) {      // hors ligne ou app en arrière-plan : notification du téléphone
+            if (!owner.online) {
+                const l = inscriptionsEnAttente.get(o) || [];
+                l.push(info);
+                inscriptionsEnAttente.set(o, l.slice(-20));
+            }
+            envoyerPush(o, {
+                type: 'joined', title: '🎉 ' + nom + ' est sur EVAT',
+                body: 'Votre contact vient de s’inscrire. Touchez pour lui écrire.',
+                tag: 'evat-joined-' + tel, from: tel
+            });
+        }
+    });
+    saveDataSoon();
+}
+
 const STATUTS_OK = new Set(['disponible', 'occupe', 'deplacement', 'focus', 'invisible']);
 
 function normaliserStatut(s) {
@@ -646,6 +778,13 @@ function lierSocket(socket, tel, user) {
     const enCours = activeCalls.get(tel);
     if (pend && !pend.acked && pend.expires > Date.now() && enCours && enCours.callId === pend.callId) {
         pend.signals.forEach(sig => socket.emit('p2p_signal', sig));
+    }
+
+    // Contacts inscrits pendant son absence
+    const nouveaux = inscriptionsEnAttente.get(tel);
+    if (nouveaux && nouveaux.length) {
+        socket.emit('contacts_joined', nouveaux);
+        inscriptionsEnAttente.delete(tel);
     }
 
     // Appels manqués pendant l'absence
@@ -930,6 +1069,7 @@ io.on('connection', (socket) => {
 
         // Seuls ceux qui ont ce numéro en contact sont prévenus
         io.to(roomWatch(tel)).emit('contact_registered', { nom, telephone: tel, metier });
+        prevenirContactsInscription(tel, nom, metier);
 
         ack(cb, {
             ok: true, recoveryPin: pin,
@@ -1022,14 +1162,20 @@ io.on('connection', (socket) => {
             // on se désabonne des anciens, on s'abonne aux nouveaux
             (socket._watched || []).forEach(t => socket.leave(roomWatch(t)));
             socket._watched = [];
-            telephones.slice(0, 500).forEach(t => {
+            const nonInscrits = new Set();
+            telephones.slice(0, 3000).forEach(t => {
                 const tel = nettoyerTel(t);
                 const u = registeredUsers.get(tel);
-                if (!u) return;
+                if (!u) {
+                    // pas encore inscrit : on s'en souvient pour prévenir ce propriétaire le jour où il s'inscrit
+                    if (tel !== socket.telephone && telEstValide(tel)) nonInscrits.add(tel);
+                    return;
+                }
                 socket.join(roomWatch(tel));
                 socket._watched.push(tel);
                 resultats.push(infoPublique(tel, u));
             });
+            if (majAttenteProprietaire(socket.telephone, nonInscrits)) saveDataSoon();
         }
         ack(cb, resultats);
     });
@@ -1242,6 +1388,16 @@ io.on('connection', (socket) => {
         ack(cb, { ok: true });
     });
 
+    // Appli native : jeton Firebase du téléphone
+    socket.on('fcm_register', (data, cb) => {
+        const u = socket.telephone && registeredUsers.get(socket.telephone);
+        const token = data && typeof data.token === 'string' ? data.token : '';
+        if (!u || token.length < 20 || token.length > 4096 || !/^[\w:\-.]+$/.test(token)) return ack(cb, { ok: false });
+        u.push = { fcm: token };
+        saveDataSoon();
+        ack(cb, { ok: true, serveurPush: fcmActif });
+    });
+
     socket.on('push_unsubscribe', (_, cb) => {
         const u = socket.telephone && registeredUsers.get(socket.telephone);
         if (u) { u.push = null; saveDataSoon(); }
@@ -1265,7 +1421,7 @@ io.on('connection', (socket) => {
 
     socket.on('push_status', (_, cb) => {
         const u = socket.telephone && registeredUsers.get(socket.telephone);
-        ack(cb, { liee: !!socket.telephone, abonne: !!(u && u.push), serveurPush: !!(webpush && vapid), sauvegarde: upstashActif ? upEtat.ok === true : null });
+        ack(cb, { liee: !!socket.telephone, abonne: !!(u && u.push), serveurPush: !!((webpush && vapid) || fcmActif), sauvegarde: upstashActif ? upEtat.ok === true : null });
     });
 
     socket.on('visibility', (hidden) => {
