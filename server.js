@@ -675,21 +675,72 @@ function typeTurnConfigure() {
     return null;
 }
 
+/** Enrichit les URLs TURN : UDP + TCP + TLS (443) — indispensable sur beaucoup de réseaux mobiles qui bloquent l’UDP 3478. */
+function enrichirUrlsTurn(urls) {
+    const out = [];
+    const vu = new Set();
+    const push = (u) => {
+        const s = String(u || '').trim();
+        if (!s || vu.has(s)) return;
+        vu.add(s); out.push(s);
+    };
+    for (const raw of urls || []) {
+        push(raw);
+        try {
+            const m = String(raw).match(/^(turns?):([^?\s]+?)(?::(\d+))?(?:\?(.+))?$/i);
+            if (!m) continue;
+            const proto = m[1].toLowerCase();
+            const host = m[2].replace(/^\/\//, '');
+            const port = m[3] || (proto === 'turns' ? '443' : '3478');
+            const q = m[4] || '';
+            // Variantes transport
+            if (!/transport=/i.test(q)) {
+                push(proto + ':' + host + ':' + port + '?transport=udp');
+                push(proto + ':' + host + ':' + port + '?transport=tcp');
+            }
+            // TLS sur 443 (passe souvent les firewalls d’opérateurs)
+            if (proto === 'turn') {
+                push('turns:' + host + ':443?transport=tcp');
+                push('turn:' + host + ':443?transport=tcp');
+            }
+            if (proto === 'turns' && port !== '443') {
+                push('turns:' + host + ':443?transport=tcp');
+            }
+        } catch (e) { /* URL non standard : on garde l’originale */ }
+    }
+    return out;
+}
+
 async function construireIce() {
-    const servers = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
+    const servers = [{
+        urls: [
+            'stun:stun.l.google.com:19302',
+            'stun:stun1.l.google.com:19302',
+            'stun:stun2.l.google.com:19302'
+        ]
+    }];
     try {
         const type = typeTurnConfigure(), t = turnConf();
         if (type === 'cloudflare') {
-            servers.push(...await iceDepuisCloudflare());
+            const cf = await iceDepuisCloudflare();
+            // Cloudflare renvoie déjà plusieurs transports ; on les garde tels quels
+            servers.push(...cf);
         } else if (type === 'coturn') {
             const expiry = Math.floor(Date.now() / 1000) + 6 * 3600;
-            const username = `${expiry}:evat`;
-            servers.push({ urls: t.urls, username, credential: crypto.createHmac('sha1', t.secret).update(username).digest('base64') });
+            const username = expiry + ':evat';
+            const credential = crypto.createHmac('sha1', t.secret).update(username).digest('base64');
+            servers.push({ urls: enrichirUrlsTurn(t.urls), username, credential });
         } else if (type === 'manuel') {
-            servers.push({ urls: t.urls, username: t.user, credential: t.cred });
+            servers.push({
+                urls: enrichirUrlsTurn(t.urls),
+                username: t.user,
+                credential: t.cred
+            });
+        } else {
+            console.warn('[TURN] Aucune config : définissez TURN_URLS + TURN_USERNAME + TURN_CREDENTIAL (Metered) ou CF_TURN_KEY_ID + CF_TURN_API_TOKEN (Cloudflare).');
         }
     } catch (e) {
-        console.warn('[TURN]', e.message);   // on retombe sur STUN seul plutôt que de bloquer l'appel
+        console.warn('[TURN]', e.message);
     }
     return servers;
 }
@@ -946,8 +997,11 @@ io.on('connection', (socket) => {
     });
 
     socket.on('get_ice', async (_, cb) => {
-        if (!socket.telephone) return ack(cb, { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
-        ack(cb, { iceServers: await construireIce() });
+        if (!socket.telephone) return ack(cb, { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }], turn: null });
+        const iceServers = await construireIce();
+        const type = typeTurnConfigure();
+        const hasTurn = iceServers.some(s => [].concat(s.urls || s.url || []).some(u => /^turns?:/i.test(String(u))));
+        ack(cb, { iceServers, turn: type, hasTurn });
     });
 
     /* ----- Signalisation d'appel ----- */
