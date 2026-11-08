@@ -173,6 +173,27 @@ async function chargerDepuisUpstash() {
         if (msgs) {
             try { JSON.parse(msgs).forEach(m => messageHistory.push(m)); upMessagesJson = msgs; } catch (e) {}
         }
+        // Groupes persistants
+        try {
+            const gplat = await upstash(['HGETALL', 'evat:groups']);
+            let ng = 0;
+            for (let i = 0; i + 1 < (gplat || []).length; i += 2) {
+                try {
+                    const g = JSON.parse(gplat[i + 1]);
+                    if (g && g.id && Array.isArray(g.membres)) {
+                        groups.set(g.id, {
+                            id: g.id,
+                            nom: String(g.nom || 'Groupe').slice(0, 60),
+                            membres: g.membres.map(t => String(t)).filter(Boolean).slice(0, GROUP_MAX_MEMBRES),
+                            createdBy: g.createdBy || '',
+                            createdAt: g.createdAt || Date.now()
+                        });
+                        ng++;
+                    }
+                } catch (e) {}
+            }
+            if (ng) console.log(`☁️ Upstash : ${ng} groupe(s) restauré(s)`);
+        } catch (e) { console.warn('[Upstash] groupes :', e.message); }
         upEtat = { ok: true, erreur: '', comptes: n };
         console.log(`☁️ Upstash : ${n} compte(s) restauré(s)`);
     } catch (e) {
@@ -709,6 +730,23 @@ function enrichirUrlsTurn(urls) {
         } catch (e) { /* URL non standard : on garde l’originale */ }
     }
     return out;
+}
+
+
+function sauverGroupeUpstash(g) {
+    if (!g || !g.id) return;
+    const blob = JSON.stringify({
+        id: g.id, nom: g.nom, membres: g.membres, createdBy: g.createdBy, createdAt: g.createdAt
+    });
+    if (upstashActif) upFile.push(['HSET', 'evat:groups', g.id, blob]);
+    upstashSauverSoon();
+    saveDataSoon();
+}
+function supprimerGroupeUpstash(id) {
+    if (!id) return;
+    if (upstashActif) upFile.push(['HDEL', 'evat:groups', id]);
+    upstashSauverSoon();
+    saveDataSoon();
 }
 
 async function construireIce() {
@@ -1358,6 +1396,7 @@ io.on('connection', (socket) => {
         const id = 'g' + Date.now().toString(36) + crypto.randomBytes(2).toString('hex');
         const g = { id, nom, membres, createdBy: socket.telephone, createdAt: Date.now() };
         groups.set(id, g);
+        sauverGroupeUpstash(g);
         membres.forEach(tel => {
             io.to(roomUser(tel)).emit('group_update', { action: 'create', group: g });
         });
@@ -1379,11 +1418,30 @@ io.on('connection', (socket) => {
         const g = groups.get(id);
         if (!g) return ack(cb, { ok: false, error: 'Groupe introuvable.' });
         g.membres = g.membres.filter(t => t !== socket.telephone);
-        if (g.membres.length === 0) groups.delete(id);
-        else {
+        if (g.membres.length === 0) {
+            groups.delete(id);
+            supprimerGroupeUpstash(id);
+        } else {
+            sauverGroupeUpstash(g);
             g.membres.forEach(tel => io.to(roomUser(tel)).emit('group_update', { action: 'leave', group: g, who: socket.telephone }));
         }
         ack(cb, { ok: true });
+    });
+
+    socket.on('group_add', (data, cb) => {
+        if (!socket.telephone) return ack(cb, { ok: false, error: 'Non connecté.' });
+        if (!limiteur(socket, 'group_add', 20, 60000)) return ack(cb, { ok: false, error: 'Trop de modifications.' });
+        const id = data && data.id;
+        const g = groups.get(id);
+        if (!g) return ack(cb, { ok: false, error: 'Groupe introuvable.' });
+        if (!g.membres.includes(socket.telephone)) return ack(cb, { ok: false, error: 'Vous n’êtes pas membre.' });
+        let ajouts = Array.isArray(data.membres) ? data.membres.map(t => nettoyerTel(t)).filter(Boolean) : [];
+        ajouts = ajouts.filter(t => registeredUsers.has(t) && !g.membres.includes(t));
+        if (!ajouts.length) return ack(cb, { ok: false, error: 'Aucun nouveau membre EVAT à ajouter.' });
+        g.membres = [...g.membres, ...ajouts].slice(0, GROUP_MAX_MEMBRES);
+        sauverGroupeUpstash(g);
+        g.membres.forEach(tel => io.to(roomUser(tel)).emit('group_update', { action: 'update', group: g }));
+        ack(cb, { ok: true, group: g });
     });
 
     // « J'ai lu la conversation avec X » → coche bleue chez X
