@@ -289,6 +289,8 @@ async function upstashEnvoyer() {
    donc personne ne peut falsifier les réponses de l'IA pour la détourner. */
 const NOM_IA = { general: 'Mister ELAWS', metier: 'Mister I' };
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || '';
+const GEMINI_KEY = String(process.env.GEMINI_API_KEY || process.env.GOOGLE_AI_API_KEY || process.env.GOOGLE_GENERATIVE_AI_API_KEY || '').trim();
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
 const AI_ENABLED = String(process.env.AI_ENABLED || 'true').toLowerCase() !== 'false';   // interrupteur d'urgence
 const AI_MODELS = {
     general: process.env.AI_MODEL_GENERAL || 'claude-sonnet-5-5',
@@ -482,6 +484,79 @@ async function streamAnthropic({ mode, system, messages, signal, web, ctx, onTex
         }
     }
     if (sources.length) onSources(sources);
+}
+
+
+/** Relais Google Gemini (gratuit) — filet de sécurité pour Mister ELAWS / Mister I / Studio */
+async function streamGemini({ system, messages, signal, onText }) {
+    if (!GEMINI_KEY) {
+        const e = new Error('Gemini non configuré');
+        e.status = 0;
+        throw e;
+    }
+    const contents = [];
+    for (const m of messages) {
+        const role = m.role === 'assistant' ? 'model' : 'user';
+        const text = String(m.content || '').slice(0, 8000);
+        if (!text) continue;
+        if (contents.length && contents[contents.length - 1].role === role) {
+            contents[contents.length - 1].parts[0].text += '\n' + text;
+        } else {
+            contents.push({ role, parts: [{ text }] });
+        }
+    }
+    if (!contents.length) contents.push({ role: 'user', parts: [{ text: 'Bonjour' }] });
+
+    const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(GEMINI_MODEL) + ':streamGenerateContent?alt=sse&key=' + encodeURIComponent(GEMINI_KEY);
+    const body = {
+        system_instruction: { parts: [{ text: String(system || '').slice(0, 12000) }] },
+        contents,
+        generationConfig: { maxOutputTokens: Math.min(typeof AI_MAX_TOKENS !== 'undefined' ? AI_MAX_TOKENS : 1024, 2048), temperature: 0.7 }
+    };
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal
+    });
+    if (!res.ok) {
+        const detail = await res.text().catch(() => '');
+        const err = new Error('Gemini ' + res.status);
+        err.status = res.status;
+        err.detail = detail.slice(0, 300);
+        throw err;
+    }
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '', total = 0;
+    const maxChars = typeof AI_MAX_CHARS !== 'undefined' ? AI_MAX_CHARS : 12000;
+    for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (signal && signal.aborted) break;
+        buf += dec.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+        let i;
+        while ((i = buf.indexOf('\n')) >= 0) {
+            let ligne = buf.slice(0, i); buf = buf.slice(i + 1);
+            if (!ligne.startsWith('data:')) continue;
+            const raw = ligne.slice(5).trim();
+            if (!raw || raw === '[DONE]') continue;
+            let ev;
+            try { ev = JSON.parse(raw); } catch (e) { continue; }
+            const parts = (((ev.candidates || [])[0] || {}).content || {}).parts || [];
+            for (const p of parts) {
+                if (p.text) {
+                    total += p.text.length;
+                    if (total > maxChars) {
+                        const e = new Error('réponse trop longue');
+                        e.tropLong = true;
+                        throw e;
+                    }
+                    onText(p.text);
+                }
+            }
+        }
+    }
 }
 
 function messageErreurIA(e) {
@@ -1293,7 +1368,7 @@ io.on('connection', (socket) => {
 
 
     /* ----- IA ----- */
-    socket.on('ai_status', (_, cb) => ack(cb, { enabled: !!ANTHROPIC_KEY && AI_ENABLED, web: webActif(), noms: NOM_IA }));
+    socket.on('ai_status', (_, cb) => ack(cb, { enabled: AI_ENABLED && !!(ANTHROPIC_KEY || GEMINI_KEY), web: webActif(), noms: NOM_IA, providers: { claude: !!ANTHROPIC_KEY, gemini: !!GEMINI_KEY } }));
 
     socket.on('ai_reset', (data) => {
         if (!socket.telephone) return;
@@ -1303,7 +1378,7 @@ io.on('connection', (socket) => {
     socket.on('ai_ask', async (data, cb) => {
         if (!socket.telephone || !data) return ack(cb, { ok: false, error: 'Connexion requise.' });
         if (!AI_ENABLED) return ack(cb, { ok: false, code: 'off', error: "L'IA est temporairement désactivée." });
-        if (!ANTHROPIC_KEY) return ack(cb, { ok: false, code: 'no_key', error: "L'IA n'est pas encore activée sur le serveur." });
+        if (!ANTHROPIC_KEY && !GEMINI_KEY) return ack(cb, { ok: false, code: 'no_key', error: "L'IA n'est pas encore activée (ANTHROPIC_API_KEY ou GEMINI_API_KEY)." });
         if (!limiteur(socket, 'ai', 12, 60000)) return ack(cb, { ok: false, error: 'Un instant : trop de questions à la suite.' });
 
         const mode = data.mode === 'metier' ? 'metier' : 'general';
@@ -1344,13 +1419,31 @@ io.on('connection', (socket) => {
                 onSources: (src) => socket.emit('ai_sources', { reqId, sources: src })
             });
             try {
-                await lancer(webActif());
+                if (ANTHROPIC_KEY) {
+                    try {
+                        await lancer(webActif());
+                    } catch (e) {
+                        if (e.status === 400 && e.web && !reponse) {
+                            webSuspenduJusqua = Date.now() + 10 * 60 * 1000;
+                            console.warn('[IA] recherche web refusée (400) →', e.detail);
+                            await lancer(false);
+                        } else if (GEMINI_KEY && !reponse && !ctrl.cancelled) {
+                            console.warn('[IA] Claude indisponible → relais Gemini');
+                            socket.emit('ai_phase', { reqId, phase: 'fallback', message: 'Relais Google…' });
+                            await streamGemini({ system: promptIA(mode, user, false, ctx), messages, signal: ctrl.signal, onText: envoyer });
+                        } else throw e;
+                    }
+                } else if (GEMINI_KEY) {
+                    await streamGemini({ system: promptIA(mode, user, false, ctx), messages, signal: ctrl.signal, onText: envoyer });
+                } else {
+                    throw Object.assign(new Error('no_key'), { status: 0 });
+                }
             } catch (e) {
-                // Recherche web non activée dans la Console Anthropic : on réessaie sans, et on arrête de l'essayer 10 min
-                if (e.status === 400 && e.web && !reponse) {
-                    webSuspenduJusqua = Date.now() + 10 * 60 * 1000;
-                    console.warn('[IA] recherche web refusée (400) : activez-la dans la Console Anthropic →', e.detail);
-                    await lancer(false);
+                if (GEMINI_KEY && !reponse && !ctrl.cancelled && ANTHROPIC_KEY) {
+                    try {
+                        console.warn('[IA] second essai Gemini');
+                        await streamGemini({ system: promptIA(mode, user, false, ctx), messages, signal: ctrl.signal, onText: envoyer });
+                    } catch (e2) { throw e; }
                 } else throw e;
             }
             // Mémoire serveur : question + réponse (10 échanges maximum)
@@ -2006,7 +2099,8 @@ app.get('/diagnostic', async (req, res) => {
 
     // IA
     if (!AI_ENABLED) warn('IA', 'Désactivée volontairement (AI_ENABLED=false).');
-    else if (!ANTHROPIC_KEY) ko('IA (Mister ELAWS et Mister I)', 'Variable ANTHROPIC_API_KEY absente.');
+    else if (!ANTHROPIC_KEY && !GEMINI_KEY) ko('IA (Mister ELAWS et Mister I)', 'Ni ANTHROPIC_API_KEY ni GEMINI_API_KEY.');
+    else if (!ANTHROPIC_KEY && GEMINI_KEY) warn('IA', 'Claude absent — relais Gemini actif.');
     else if (!test) ok('IA (Mister ELAWS et Mister I)', 'Clé présente. Ajoutez &test=1 à l\'adresse pour la tester pour de vrai.');
     else {
         try {
@@ -2085,7 +2179,8 @@ app.get('/', (req, res) => {
     res.json({
         status: 'EVAT Continuum Signaling Server v4.9',
         push: !!(webpush && vapid),
-        ai: !!ANTHROPIC_KEY && AI_ENABLED,
+        ai: AI_ENABLED && !!(ANTHROPIC_KEY || GEMINI_KEY),
+        providers: { claude: !!ANTHROPIC_KEY, gemini: !!GEMINI_KEY },
         online: compterEnLigne(),
         time: new Date().toISOString()
     });
