@@ -290,8 +290,7 @@ async function upstashEnvoyer() {
 const NOM_IA = { general: 'Mister ELAWS', metier: 'Mister I' };
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || '';
 const GEMINI_KEY = String(process.env.GEMINI_API_KEY || process.env.GOOGLE_AI_API_KEY || process.env.GOOGLE_GENERATIVE_AI_API_KEY || '').trim();
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
-const GEMINI_MODELES = [GEMINI_MODEL, 'gemini-3.8-flash', 'gemini-3.5-flash-lite', 'gemini-2.5-flash-lite', 'gemini-flash-latest']
+const GEMINI_MODELES = ['gemini-2.5-flash-lite', 'gemini-flash-latest', 'gemini-2.5-flash', 'gemini-3.5-flash-lite', process.env.GEMINI_MODEL, 'gemini-3.8-flash']
     .filter((m, i, a) => m && a.indexOf(m) === i);
 const AI_ENABLED = String(process.env.AI_ENABLED || 'true').toLowerCase() !== 'false';   // interrupteur d'urgence
 const AI_MODELS = {
@@ -539,8 +538,12 @@ async function streamGemini({ system, messages, signal, onText }) {
             const err = new Error('Gemini ' + res.status + ' (' + model + ')');
             err.status = res.status;
             err.detail = detail.slice(0, 400);
-            // Modèle arrêté ou inconnu : essayer le suivant
-            if (res.status === 404 || res.status === 400) { lastErr = err; continue; }
+            // Modèle arrêté, saturé ou quota : essayer le modèle suivant
+            if (res.status === 404 || res.status === 400 || res.status === 429 || res.status === 503) {
+                lastErr = err;
+                if (res.status === 429 || res.status === 503) await new Promise(r => setTimeout(r, 1200));
+                continue;
+            }
             throw err;
         }
         const j = await res.json().catch(() => null);
@@ -564,13 +567,14 @@ async function streamGemini({ system, messages, signal, onText }) {
 
 function messageErreurIA(e) {
     if (e && e.tropLong) return 'La réponse devenait trop longue. Posez une question plus précise.';
-    if (e && (e.status === 429 || e.status === 529 || e.status === 503)) return `${NOM_IA.general} est très sollicitée en ce moment. Réessayez dans quelques secondes.`;
     if (e && e.name === 'AbortError') return 'La réponse a pris trop de temps. Réessayez.';
     if (e && /Gemini/.test(String(e.message || ''))) {
         if (e.status === 401 || e.status === 403) return "Clé Gemini refusée. Recopiez la clé complète dans GEMINI_API_KEY sur Render (sans espace), puis redéployez.";
-        if (e.status === 404) return "Modèle Gemini introuvable. Redéployez le serveur corrigé (gemini-3.8-flash).";
+        if (e.status === 429) return "Quota gratuit Gemini atteint. Attendez une minute, puis réessayez.";
+        if (e.status === 404) return "Modèle Gemini introuvable. Redéployez ce serveur.";
         return "Gemini n'a pas pu répondre (" + (e.status || 'erreur') + "). Réessayez dans un instant.";
     }
+    if (e && (e.status === 429 || e.status === 529 || e.status === 503)) return `${NOM_IA.general} est très sollicitée en ce moment. Réessayez dans quelques secondes.`;
     return "L'IA est momentanément indisponible. Réessayez dans un instant.";
 }
 
@@ -1427,32 +1431,30 @@ io.on('connection', (socket) => {
                 onSources: (src) => socket.emit('ai_sources', { reqId, sources: src })
             });
             try {
-                if (ANTHROPIC_KEY) {
+                // Gemini d'abord dès que la clé Google est là. Claude seulement en secours.
+                if (GEMINI_KEY) {
+                    try {
+                        await streamGemini({ system: promptIA(mode, user, false, ctx), messages, signal: ctrl.signal, onText: envoyer });
+                    } catch (e) {
+                        if (ANTHROPIC_KEY && !reponse && !ctrl.cancelled) {
+                            console.warn('[IA] Gemini indisponible → secours Claude', e.status || '', e.message);
+                            await lancer(false);
+                        } else throw e;
+                    }
+                } else if (ANTHROPIC_KEY) {
                     try {
                         await lancer(webActif());
                     } catch (e) {
                         if (e.status === 400 && e.web && !reponse) {
                             webSuspenduJusqua = Date.now() + 10 * 60 * 1000;
-                            console.warn('[IA] recherche web refusée (400) →', e.detail);
                             await lancer(false);
-                        } else if (GEMINI_KEY && !reponse && !ctrl.cancelled) {
-                            console.warn('[IA] Claude indisponible → relais Gemini');
-                            socket.emit('ai_phase', { reqId, phase: 'fallback', message: 'Relais Google…' });
-                            await streamGemini({ system: promptIA(mode, user, false, ctx), messages, signal: ctrl.signal, onText: envoyer });
                         } else throw e;
                     }
-                } else if (GEMINI_KEY) {
-                    await streamGemini({ system: promptIA(mode, user, false, ctx), messages, signal: ctrl.signal, onText: envoyer });
                 } else {
                     throw Object.assign(new Error('no_key'), { status: 0 });
                 }
             } catch (e) {
-                if (GEMINI_KEY && !reponse && !ctrl.cancelled && ANTHROPIC_KEY) {
-                    try {
-                        console.warn('[IA] second essai Gemini');
-                        await streamGemini({ system: promptIA(mode, user, false, ctx), messages, signal: ctrl.signal, onText: envoyer });
-                    } catch (e2) { throw e; }
-                } else throw e;
+                throw e;
             }
             // Mémoire serveur : question + réponse (10 échanges maximum)
             mem.messages.push({ role: 'user', content: texte }, { role: 'assistant', content: reponse });
@@ -2183,6 +2185,21 @@ app.get('/diagnostic', async (req, res) => {
 });
 
 app.get('/health', (req, res) => res.status(200).send('ok'));
+app.get('/gemini-test', async (req, res) => {
+    if (!GEMINI_KEY) return res.status(200).json({ ok: false, error: 'GEMINI_API_KEY absente' });
+    let texte = '';
+    try {
+        await streamGemini({
+            system: 'Réponds uniquement le mot OK.',
+            messages: [{ role: 'user', content: 'Dis OK' }],
+            signal: AbortSignal.timeout(25000),
+            onText: (t) => { texte += t; }
+        });
+        res.json({ ok: !!texte.trim(), reponse: texte.slice(0, 200) });
+    } catch (e) {
+        res.status(200).json({ ok: false, status: e.status || 0, error: messageErreurIA(e), detail: String(e.message || '').slice(0, 180) });
+    }
+});
 app.get('/', (req, res) => {
     res.json({
         status: 'EVAT Continuum Signaling Server v4.9',
