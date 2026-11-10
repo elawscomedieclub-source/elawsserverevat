@@ -1,5 +1,5 @@
 /* ============================================================
-   EVAT Continuum — Serveur de signalisation v4.9
+   EVAT Continuum — Serveur de signalisation v4.10
    - Identité serveur-autoritaire (le client ne peut plus usurper "sender/from")
    - PIN hashé avec scrypt + anti brute-force
    - Présence ciblée (plus de diffusion de tous les numéros à tout le monde)
@@ -42,6 +42,7 @@ const corsOrigin = ALLOWED_ORIGINS.includes('*') ? '*' : ALLOWED_ORIGINS;
 
 const app = express();
 app.disable('x-powered-by');
+app.set('trust proxy', 1);   // Render est derrière un proxy : req.ip = vraie IP du client
 app.use(cors({ origin: corsOrigin }));
 app.use(express.json({ limit: '10kb' }));
 
@@ -290,7 +291,7 @@ async function upstashEnvoyer() {
 const NOM_IA = { general: 'Mister ELAWS', metier: 'Mister I' };
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || '';
 const GEMINI_KEY = String(process.env.GEMINI_API_KEY || process.env.GOOGLE_AI_API_KEY || process.env.GOOGLE_GENERATIVE_AI_API_KEY || '').trim();
-const GEMINI_MODELES = ['gemini-2.5-flash-lite', 'gemini-flash-latest', 'gemini-2.5-flash', 'gemini-3.5-flash-lite', process.env.GEMINI_MODEL, 'gemini-3.8-flash']
+const GEMINI_MODELES = ['gemini-2.5-flash-lite', 'gemini-flash-latest', 'gemini-2.5-flash', process.env.GEMINI_MODEL]
     .filter((m, i, a) => m && a.indexOf(m) === i);
 const AI_ENABLED = String(process.env.AI_ENABLED || 'true').toLowerCase() !== 'false';   // interrupteur d'urgence
 const AI_MODELS = {
@@ -2089,7 +2090,7 @@ app.get('/diagnostic', async (req, res) => {
     const L = [];   // [statut, titre, détail]
     const ok = (t, d) => L.push(['✅', t, d]), warn = (t, d) => L.push(['⚠️', t, d]), ko = (t, d) => L.push(['❌', t, d]);
 
-    ok('Serveur EVAT', `v4.9 démarré. ${registeredUsers.size} compte(s), ${compterEnLigne()} en ligne.`);
+    ok('Serveur EVAT', `v4.10 démarré. ${registeredUsers.size} compte(s), ${compterEnLigne()} en ligne.`);
 
     // Comptes
     if (upstashActif && !upUrlValide) {
@@ -2186,6 +2187,8 @@ app.get('/diagnostic', async (req, res) => {
 
 app.get('/health', (req, res) => res.status(200).send('ok'));
 app.get('/gemini-test', async (req, res) => {
+    const adminTok = process.env.ADMIN_TOKEN || '';
+    if (!adminTok || String(req.query.token || req.headers['x-admin-token'] || '') !== adminTok) return res.status(403).json({ ok: false, error: 'Accès refusé : ajoutez ?token=VOTRE_ADMIN_TOKEN' });
     if (!GEMINI_KEY) return res.status(200).json({ ok: false, error: 'GEMINI_API_KEY absente' });
     let texte = '';
     try {
@@ -2202,7 +2205,7 @@ app.get('/gemini-test', async (req, res) => {
 });
 app.get('/', (req, res) => {
     res.json({
-        status: 'EVAT Continuum Signaling Server v4.9',
+        status: 'EVAT Continuum Signaling Server v4.10',
         push: !!(webpush && vapid),
         ai: AI_ENABLED && !!(ANTHROPIC_KEY || GEMINI_KEY),
         providers: { claude: !!ANTHROPIC_KEY, gemini: !!GEMINI_KEY },
@@ -2214,7 +2217,7 @@ app.get('/', (req, res) => {
 (async () => {
     await Promise.race([chargerDepuisUpstash(), new Promise(r => setTimeout(r, 8000))]);   // jamais bloqué plus de 8 s
     initialiserPush();
-    server.listen(PORT, () => console.log(`🚀 EVAT Continuum v4.9 actif sur le port ${PORT}`));
+    server.listen(PORT, () => console.log(`🚀 EVAT Continuum v4.10 actif sur le port ${PORT}`));
 })();
 
 async function arret() {

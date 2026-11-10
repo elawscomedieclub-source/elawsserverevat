@@ -1,14 +1,10 @@
 {
-  "name": "evat-server",
-  "version": "4.9.0",
-  "description": "Serveur de signalisation WebRTC pour EVAT Continuum",
+  "name": "evat-continuum-serveur",
+  "version": "4.10.0",
+  "description": "Serveur EVAT Continuum (signalisation, messagerie, notifications, IA)",
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "engines": {
-    "node": ">=18"
-  },
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2",
