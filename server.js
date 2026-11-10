@@ -66,6 +66,7 @@ const MSG_SUSPENDU = 'Votre compte a été suspendu par l’administrateur. Cont
 const MSG_SUPPRIME = 'Ce compte a été supprimé par l’administrateur. Vous pouvez vous réinscrire.';
 const messageHistory = [];
 const MAX_HISTORY = 400;
+const REACTIONS_AUTORISEES = ['👍', '❤️', '😂', '😮', '😢', '🙏'];
 const groups = new Map(); // id → { id, nom, membres: string[], createdBy, createdAt }
 const GROUP_MAX_MEMBRES = 30;
 const missedCalls = new Map();   // tel → [{from, at, callType}]
@@ -1642,6 +1643,43 @@ io.on('connection', (socket) => {
         ack(cb, { ok: true, id: msg.id, delivered: msg.delivered });
     });
 
+    /* ----- Réactions aux messages (une réaction par personne, comme WhatsApp) ----- */
+    socket.on('react_message', (data, cb) => {
+        const me = socket.telephone;
+        if (!me || !data) return ack(cb, { ok: false });
+        if (!limiteur(socket, 'react', 30, 10000)) return ack(cb, { ok: false });
+        const id = String(data.id || '').slice(0, 40);
+        const emoji = String(data.emoji || '');
+        if (!REACTIONS_AUTORISEES.includes(emoji)) return ack(cb, { ok: false });
+        const m = messageHistory.find(x => x.id === id);
+        if (!m) return ack(cb, { ok: false });
+
+        let destinataires = null;                       // null = discussion générale (tout le monde)
+        if (m.groupId) {
+            const g = groups.get(m.groupId);
+            if (!g || !g.membres.includes(me)) return ack(cb, { ok: false });
+            destinataires = g.membres.slice();
+        } else if (m.to) {
+            if (m.from !== me && m.to !== me) return ack(cb, { ok: false });
+            destinataires = [m.from, m.to];
+        }
+
+        const r = m.reactions = m.reactions || {};
+        const avait = (r[emoji] || []).includes(me);
+        Object.keys(r).forEach(e => {                   // une seule réaction par personne
+            r[e] = r[e].filter(t => t !== me);
+            if (!r[e].length) delete r[e];
+        });
+        if (!avait) (r[emoji] = r[emoji] || []).push(me);
+        if (!Object.keys(r).length) delete m.reactions;
+
+        const evt = { id: m.id, reactions: m.reactions || {} };
+        if (destinataires) destinataires.forEach(t => io.to(roomUser(t)).emit('message_reaction', evt));
+        else io.emit('message_reaction', evt);
+        saveDataSoon();
+        ack(cb, { ok: true });
+    });
+
     /* ----- Groupes légers ----- */
     socket.on('group_create', (data, cb) => {
         if (!socket.telephone) return ack(cb, { ok: false, error: 'Non connecté.' });
@@ -1792,7 +1830,9 @@ io.on('connection', (socket) => {
         const livres = {};
         for (let i = messageHistory.length - 1; i >= 0 && out.length < n; i--) {
             const m = messageHistory[i];
-            if (!m.to || m.to === me || m.from === me) {
+            const g = m.groupId ? groups.get(m.groupId) : null;
+            const visible = m.groupId ? !!(g && g.membres.includes(me)) : (!m.to || m.to === me || m.from === me);
+            if (visible) {
                 out.push(m);
                 if (m.to === me && !m.delivered) { m.delivered = true; (livres[m.from] = livres[m.from] || []).push(m.id); }
             }
