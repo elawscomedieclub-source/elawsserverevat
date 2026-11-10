@@ -290,7 +290,9 @@ async function upstashEnvoyer() {
 const NOM_IA = { general: 'Mister ELAWS', metier: 'Mister I' };
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || '';
 const GEMINI_KEY = String(process.env.GEMINI_API_KEY || process.env.GOOGLE_AI_API_KEY || process.env.GOOGLE_GENERATIVE_AI_API_KEY || '').trim();
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+const GEMINI_MODELES = [GEMINI_MODEL, 'gemini-3.8-flash', 'gemini-3.5-flash-lite', 'gemini-2.5-flash-lite', 'gemini-flash-latest']
+    .filter((m, i, a) => m && a.indexOf(m) === i);
 const AI_ENABLED = String(process.env.AI_ENABLED || 'true').toLowerCase() !== 'false';   // interrupteur d'urgence
 const AI_MODELS = {
     general: process.env.AI_MODEL_GENERAL || 'claude-sonnet-5-5',
@@ -487,7 +489,7 @@ async function streamAnthropic({ mode, system, messages, signal, web, ctx, onTex
 }
 
 
-/** Relais Google Gemini (gratuit) — filet de sécurité pour Mister ELAWS / Mister I / Studio */
+/** Relais Google Gemini. Clés AI Studio « AQ. » : en-tête x-goog-api-key. Modèle 2.0 est arrêté. */
 async function streamGemini({ system, messages, signal, onText }) {
     if (!GEMINI_KEY) {
         const e = new Error('Gemini non configuré');
@@ -507,62 +509,68 @@ async function streamGemini({ system, messages, signal, onText }) {
     }
     if (!contents.length) contents.push({ role: 'user', parts: [{ text: 'Bonjour' }] });
 
-    const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(GEMINI_MODEL) + ':streamGenerateContent?alt=sse&key=' + encodeURIComponent(GEMINI_KEY);
-    const body = {
+    const body = JSON.stringify({
         system_instruction: { parts: [{ text: String(system || '').slice(0, 12000) }] },
         contents,
-        generationConfig: { maxOutputTokens: Math.min(typeof AI_MAX_TOKENS !== 'undefined' ? AI_MAX_TOKENS : 1024, 2048), temperature: 0.7 }
-    };
-    const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        signal
+        generationConfig: { maxOutputTokens: Math.min(typeof AI_MAX_TOKENS !== 'undefined' ? AI_MAX_TOKENS : 1500, 2048), temperature: 0.7 }
     });
-    if (!res.ok) {
-        const detail = await res.text().catch(() => '');
-        const err = new Error('Gemini ' + res.status);
-        err.status = res.status;
-        err.detail = detail.slice(0, 300);
-        throw err;
-    }
-    const reader = res.body.getReader();
-    const dec = new TextDecoder();
-    let buf = '', total = 0;
-    const maxChars = typeof AI_MAX_CHARS !== 'undefined' ? AI_MAX_CHARS : 12000;
-    for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (signal && signal.aborted) break;
-        buf += dec.decode(value, { stream: true }).replace(/\r\n/g, '\n');
-        let i;
-        while ((i = buf.indexOf('\n')) >= 0) {
-            let ligne = buf.slice(0, i); buf = buf.slice(i + 1);
-            if (!ligne.startsWith('data:')) continue;
-            const raw = ligne.slice(5).trim();
-            if (!raw || raw === '[DONE]') continue;
-            let ev;
-            try { ev = JSON.parse(raw); } catch (e) { continue; }
-            const parts = (((ev.candidates || [])[0] || {}).content || {}).parts || [];
-            for (const p of parts) {
-                if (p.text) {
-                    total += p.text.length;
-                    if (total > maxChars) {
-                        const e = new Error('réponse trop longue');
-                        e.tropLong = true;
-                        throw e;
-                    }
-                    onText(p.text);
-                }
-            }
+
+    let lastErr = null;
+    for (const model of GEMINI_MODELES) {
+        const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent';
+        let res;
+        try {
+            res = await fetch(url, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'x-goog-api-key': GEMINI_KEY
+                },
+                body,
+                signal
+            });
+        } catch (e) {
+            if (e && e.name === 'AbortError') throw e;
+            lastErr = e;
+            continue;
         }
+        if (!res.ok) {
+            const detail = await res.text().catch(() => '');
+            const err = new Error('Gemini ' + res.status + ' (' + model + ')');
+            err.status = res.status;
+            err.detail = detail.slice(0, 400);
+            // Modèle arrêté ou inconnu : essayer le suivant
+            if (res.status === 404 || res.status === 400) { lastErr = err; continue; }
+            throw err;
+        }
+        const j = await res.json().catch(() => null);
+        const parts = (((j && j.candidates && j.candidates[0]) || {}).content || {}).parts || [];
+        let texte = '';
+        for (const p of parts) if (p && p.text) texte += p.text;
+        texte = texte.trim();
+        if (!texte) {
+            const block = j && j.promptFeedback && j.promptFeedback.blockReason;
+            lastErr = Object.assign(new Error(block ? ('Gemini bloqué : ' + block) : 'Gemini réponse vide (' + model + ')'), { status: 502 });
+            continue;
+        }
+        const maxChars = typeof AI_MAX_CHARS !== 'undefined' ? AI_MAX_CHARS : 12000;
+        const out = texte.slice(0, maxChars);
+        // Découpe pour que l'interface affiche le texte progressivement
+        for (let i = 0; i < out.length; i += 120) onText(out.slice(i, i + 120));
+        return;
     }
+    throw lastErr || Object.assign(new Error('Gemini indisponible'), { status: 502 });
 }
 
 function messageErreurIA(e) {
     if (e && e.tropLong) return 'La réponse devenait trop longue. Posez une question plus précise.';
     if (e && (e.status === 429 || e.status === 529 || e.status === 503)) return `${NOM_IA.general} est très sollicitée en ce moment. Réessayez dans quelques secondes.`;
     if (e && e.name === 'AbortError') return 'La réponse a pris trop de temps. Réessayez.';
+    if (e && /Gemini/.test(String(e.message || ''))) {
+        if (e.status === 401 || e.status === 403) return "Clé Gemini refusée. Recopiez la clé complète dans GEMINI_API_KEY sur Render (sans espace), puis redéployez.";
+        if (e.status === 404) return "Modèle Gemini introuvable. Redéployez le serveur corrigé (gemini-3.8-flash).";
+        return "Gemini n'a pas pu répondre (" + (e.status || 'erreur') + "). Réessayez dans un instant.";
+    }
     return "L'IA est momentanément indisponible. Réessayez dans un instant.";
 }
 
