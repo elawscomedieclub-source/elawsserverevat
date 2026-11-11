@@ -44,6 +44,8 @@ const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', 1);   // Render est derrière un proxy : req.ip = vraie IP du client
 app.use(cors({ origin: corsOrigin }));
+// Webhook de paiement : doit recevoir le corps BRUT (signature), donc déclaré avant express.json
+app.post('/webhooks/fedapay', express.raw({ type: '*/*', limit: '100kb' }), (req, res) => traiterWebhookFedapay(req, res));
 app.use(express.json({ limit: '10kb' }));
 
 const server = http.createServer(app);
@@ -74,6 +76,25 @@ const activeCalls = new Map();   // tel → { peer, callId, since }
 const failedAttempts = new Map(); // clé → { count, until }
 const pendingCalls = new Map();  // tel du destinataire → { callId, from, signals[], expires, acked }
 let vapid = null;                // { publicKey, privateKey }
+// Statuts de 24 h (texte sur fond coloré ou photo) : { id, from, texte, bg, image, ts, vues: [tel] }
+const statuts = [];
+const STATUT_DUREE = 24 * 3600 * 1000, STATUT_MAX_PAR_USER = 10, STATUT_MAX_TOTAL = 400;
+function purgerStatuts() {
+    const limite = Date.now() - STATUT_DUREE;
+    for (let i = statuts.length - 1; i >= 0; i--) if (statuts[i].ts < limite) statuts.splice(i, 1);
+}
+// Version allégée (sans photos) pour Upstash : limite de taille des requêtes
+const statutsVersJson = (avecImages) => JSON.stringify(statuts.map(s => avecImages ? s : Object.assign({}, s, { image: null })));
+function statutsDepuisJson(txt) {
+    try {
+        JSON.parse(txt).forEach(s => {
+            if (s && s.id && s.from && s.ts > Date.now() - STATUT_DUREE && !statuts.some(x => x.id === s.id) && (s.texte || s.image)) statuts.push(s);
+        });
+    } catch (e) { /* illisible : ignoré */ }
+}
+
+setInterval(() => { const n = statuts.length; purgerStatuts(); if (statuts.length !== n) saveDataSoon(); }, 10 * 60 * 1000);
+
 // Numéros que des utilisateurs ont en contact mais qui n'ont pas encore de compte :
 // à l'inscription de ce numéro, ceux qui l'ont en contact reçoivent « votre contact vient de s'inscrire ».
 const attenteInscription = new Map();         // numéro non inscrit → Set des propriétaires du contact
@@ -128,6 +149,7 @@ function loadData() {
         (raw.supprimes || []).forEach(([t, ts]) => supprimes.set(t, ts));
         (raw.messages || []).forEach(m => messageHistory.push(m));
         if (raw.vapid && raw.vapid.publicKey) vapid = raw.vapid;
+        if (Array.isArray(raw.statuts)) statutsDepuisJson(JSON.stringify(raw.statuts));
         if (Array.isArray(raw.attente)) raw.attente.forEach(([t, liste]) => (liste || []).forEach(o => ajouterAttente(String(o), String(t))));
         console.log(`💾 ${registeredUsers.size} comptes chargés`);
     } catch (e) { /* premier démarrage */ }
@@ -152,7 +174,7 @@ function saveDataNow() {
             });
         }
         const tmp = DATA_FILE + '.tmp';
-        fs.writeFileSync(tmp, JSON.stringify({ users, supprimes: [...supprimes], vapid, messages: messageHistory.slice(-MAX_HISTORY), attente: [...attenteInscription].map(([t, set]) => [t, [...set]]) }));
+        fs.writeFileSync(tmp, JSON.stringify({ users, supprimes: [...supprimes], vapid, messages: messageHistory.slice(-MAX_HISTORY), attente: [...attenteInscription].map(([t, set]) => [t, [...set]]), statuts }));
         fs.renameSync(tmp, DATA_FILE);
     } catch (e) {
         console.warn('Sauvegarde impossible :', e.message);
@@ -174,7 +196,7 @@ const upstashActif = !!(UP_URL && UP_TOKEN);
 const upUrlValide = (() => { try { return new URL(UP_URL).protocol === 'https:'; } catch (e) { return false; } })();
 const upFile = [];      // commandes en attente (suppressions de comptes)
 const upDerniers = new Map();      // tel -> dernier JSON enregistré (on n'écrit que ce qui change)
-let upAttenteJson = '', upMessagesJson = '', upMessagesT = 0, upTimer = null, upEtat = { ok: null, erreur: '', comptes: 0 };
+let upStatutsJson = '', upAttenteJson = '', upMessagesJson = '', upMessagesT = 0, upTimer = null, upEtat = { ok: null, erreur: '', comptes: 0 };
 
 async function upstash(commande, pipeline) {
     const r = await fetch(UP_URL + (pipeline ? '/pipeline' : ''), {
@@ -215,6 +237,11 @@ async function chargerDepuisUpstash() {
         if (msgs) {
             try { JSON.parse(msgs).forEach(m => messageHistory.push(m)); upMessagesJson = msgs; } catch (e) {}
         }
+        // Statuts 24 h (texte seulement : les photos restent dans le fichier local du serveur)
+        try {
+            const st = await upstash(['GET', 'evat:statuts']);
+            if (st) { statutsDepuisJson(st); upStatutsJson = statutsVersJson(false); }
+        } catch (e) { console.warn('[Upstash] statuts :', e.message); }
         // Contacts en attente d'inscription
         try {
             const att = await upstash(['GET', 'evat:attente']);
@@ -269,6 +296,9 @@ async function upstashEnvoyer() {
         const mj = JSON.stringify(messageHistory.slice(-MAX_HISTORY));
         if (mj !== upMessagesJson) { cmds.push(['SET', 'evat:messages', mj]); suites.push(() => { upMessagesJson = mj; upMessagesT = Date.now(); }); }
     }
+    purgerStatuts();
+    const sj = statutsVersJson(false);
+    if (sj !== upStatutsJson) { cmds.push(['SET', 'evat:statuts', sj, 'EX', 90000]); suites.push(() => { upStatutsJson = sj; }); }
     const aj = attenteVersJson();
     if (aj !== upAttenteJson) { cmds.push(['SET', 'evat:attente', aj]); suites.push(() => { upAttenteJson = aj; }); }
     if (!cmds.length) return;
@@ -1680,6 +1710,79 @@ io.on('connection', (socket) => {
         ack(cb, { ok: true });
     });
 
+    /* ----- Statuts de 24 h ----- */
+    socket.on('statut_publier', (d, cb) => {
+        const me = socket.telephone;
+        const u = me && registeredUsers.get(me);
+        if (!u || !d) return ack(cb, { ok: false });
+        if (!limiteur(socket, 'statut', 10, 600000)) return ack(cb, { ok: false, error: 'Trop de statuts, patientez quelques minutes.' });
+        const texte = typeof d.texte === 'string' ? d.texte.trim().slice(0, 700) : '';
+        let image = null;
+        if (typeof d.image === 'string' && d.image) {
+            if (!/^data:image\/(jpeg|png|webp);base64,/.test(d.image.slice(0, 40)) || d.image.length > 300000) return ack(cb, { ok: false, error: 'Photo invalide ou trop lourde.' });
+            image = d.image;
+        }
+        if (!texte && !image) return ack(cb, { ok: false, error: 'Statut vide.' });
+        const bg = (typeof d.bg === 'string' && /^#[0-9a-fA-F]{6}$/.test(d.bg)) ? d.bg : '#0e7490';
+        purgerStatuts();
+        const miens = statuts.filter(x => x.from === me);
+        while (miens.length >= STATUT_MAX_PAR_USER) statuts.splice(statuts.indexOf(miens.shift()), 1);
+        while (statuts.length >= STATUT_MAX_TOTAL) statuts.shift();
+        const st = { id: crypto.randomBytes(8).toString('hex'), from: me, texte, bg, image, ts: Date.now(), vues: [] };
+        statuts.push(st);
+        io.to(roomWatch(me)).emit('statut_nouveau', { from: me, nom: u.nom, id: st.id });
+        saveDataSoon();
+        ack(cb, { ok: true, id: st.id });
+    });
+
+    socket.on('statuts_lister', (d, cb) => {
+        const me = socket.telephone;
+        if (!me) return ack(cb, { ok: false });
+        if (!limiteur(socket, 'statuts_l', 30, 60000)) return ack(cb, { ok: false });
+        purgerStatuts();
+        const voulus = new Set((Array.isArray(d && d.telephones) ? d.telephones : []).slice(0, 3000).map(nettoyerTel));
+        voulus.add(me);
+        const liste = statuts.filter(s => voulus.has(s.from)).map(s => {
+            const u = registeredUsers.get(s.from);
+            return { id: s.id, from: s.from, nom: (u && u.nom) || '', texte: s.texte, bg: s.bg, hasImage: !!s.image, ts: s.ts,
+                     vu: s.from === me || s.vues.includes(me), nbVues: s.from === me ? s.vues.length : undefined };
+        }).filter(x => registeredUsers.get(x.from) && !registeredUsers.get(x.from).bloque);
+        ack(cb, { ok: true, statuts: liste });
+    });
+
+    socket.on('statut_image', (d, cb) => {
+        if (!socket.telephone || !d) return ack(cb, { ok: false });
+        if (!limiteur(socket, 'statut_img', 60, 60000)) return ack(cb, { ok: false });
+        const s = statuts.find(x => x.id === String(d.id || ''));
+        ack(cb, s && s.image ? { ok: true, image: s.image } : { ok: false });
+    });
+
+    socket.on('statut_vu', (d) => {
+        const me = socket.telephone;
+        if (!me || !d) return;
+        const s = statuts.find(x => x.id === String(d.id || ''));
+        if (!s || s.from === me || s.vues.includes(me) || s.vues.length >= 500) return;
+        s.vues.push(me);
+        saveDataSoon();
+    });
+
+    socket.on('statut_vues', (d, cb) => {
+        const me = socket.telephone;
+        const s = me && statuts.find(x => x.id === String((d && d.id) || ''));
+        if (!s || s.from !== me) return ack(cb, { ok: false });
+        ack(cb, { ok: true, vues: s.vues.map(t => ({ telephone: t, nom: (registeredUsers.get(t) || {}).nom || t })) });
+    });
+
+    socket.on('statut_supprimer', (d, cb) => {
+        const me = socket.telephone;
+        const i = me ? statuts.findIndex(x => x.id === String((d && d.id) || '') && x.from === me) : -1;
+        if (i < 0) return ack(cb, { ok: false });
+        statuts.splice(i, 1);
+        io.to(roomWatch(me)).emit('statut_retire', { from: me, id: String(d.id) });
+        saveDataSoon();
+        ack(cb, { ok: true });
+    });
+
     /* ----- Groupes légers ----- */
     socket.on('group_create', (data, cb) => {
         if (!socket.telephone) return ack(cb, { ok: false, error: 'Non connecté.' });
@@ -2223,6 +2326,240 @@ app.get('/diagnostic', async (req, res) => {
 <p style="margin-top:20px"><a href="?token=${encodeURIComponent(donne)}&amp;test=1">▶ Lancer les tests réels (IA, Internet, TURN)</a></p>
 <p><a href="/admin?token=${encodeURIComponent(donne)}">🛡️ Ouvrir l’administration des comptes</a></p>
 <p style="color:#7589a8;font-size:12px">Les tests réels utilisent un peu de crédit Anthropic (moins d'un centime).</p></body></html>`);
+});
+
+
+/* ============================================================
+   INTÉGRATIONS : API partenaires, paiement mobile (FedaPay), SMS (Africa's Talking)
+   Tout est désactivé tant que les variables d'environnement correspondantes ne sont pas renseignées.
+   ============================================================ */
+// PARTNER_KEYS="cantine:CLE_LONGUE_1,mikrotik:CLE_LONGUE_2"  (clé de 24 caractères minimum)
+const PARTENAIRES = [];
+String(process.env.PARTNER_KEYS || '').split(',').map(x => x.trim()).filter(Boolean).forEach(p => {
+    const i = p.indexOf(':');
+    if (i < 1) return;
+    const nom = p.slice(0, i).trim().toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 24);
+    const cle = p.slice(i + 1).trim();
+    if (nom && cle.length >= 24) PARTENAIRES.push({ nom, cle, hash: crypto.createHash('sha256').update(cle).digest() });
+});
+// Les adresses de rappel (webhooks sortants) doivent appartenir à cette liste de domaines (protection SSRF)
+const HOTES_RAPPEL = String(process.env.PARTNER_CALLBACK_HOSTS || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
+const partenaireLimites = new Map();
+
+function trouverPartenaire(req) {
+    const m = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || '');
+    if (!m) return null;
+    const h = crypto.createHash('sha256').update(m[1].trim()).digest();
+    let trouve = null;
+    PARTENAIRES.forEach(p => { if (crypto.timingSafeEqual(p.hash, h)) trouve = p; });
+    return trouve;
+}
+function authPartenaire(req, res, next) {
+    const p = trouverPartenaire(req);
+    if (!p) return res.status(401).json({ ok: false, error: 'unauthorized' });
+    const now = Date.now();
+    const l = partenaireLimites.get(p.nom) || { debut: now, n: 0 };
+    if (now - l.debut > 60000) { l.debut = now; l.n = 0; }
+    if (++l.n > 120) return res.status(429).json({ ok: false, error: 'rate_limited' });
+    partenaireLimites.set(p.nom, l);
+    req.partenaire = p;
+    next();
+}
+
+/** Dépose un message de service dans la boîte EVAT d'un utilisateur (expéditeur « svc-nom », lecture seule) */
+function livrerMessagePartenaire(partenaire, telDest, texte) {
+    const dest = registeredUsers.get(telDest);
+    if (!dest || dest.bloque) return null;
+    const texteNet = String(texte || '').trim().slice(0, 1000);
+    if (!texteNet) return null;
+    const nomAffiche = '🔔 ' + partenaire.nom.charAt(0).toUpperCase() + partenaire.nom.slice(1);
+    const msg = {
+        id: Date.now().toString(36) + crypto.randomBytes(3).toString('hex'),
+        from: 'svc-' + partenaire.nom, fromName: nomAffiche, to: telDest, groupId: null, groupName: null,
+        texte: texteNet, image: null, audio: null, audioDur: 0,
+        heure: new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'UTC' }),
+        timestamp: Date.now(), cid: '', delivered: !!dest.online, read: false, service: true
+    };
+    messageHistory.push(msg);
+    if (messageHistory.length > MAX_HISTORY * 2) messageHistory.splice(0, messageHistory.length - MAX_HISTORY);
+    io.to(roomUser(telDest)).emit('new_message', msg);
+    if (!joignableDirect(dest)) {
+        envoyerPush(telDest, {
+            type: 'message', title: nomAffiche, body: texteNet.length > 140 ? texteNet.slice(0, 137) + '…' : texteNet,
+            from: msg.from, tag: 'msg-' + msg.from
+        });
+    }
+    saveDataSoon();
+    return msg;
+}
+
+/* ----- SMS (Africa's Talking) : AT_USERNAME, AT_API_KEY, AT_SENDER (facultatif) ----- */
+const smsActif = !!(process.env.AT_USERNAME && process.env.AT_API_KEY);
+async function envoyerSms(numero, texte) {
+    if (!smsActif) return false;
+    try {
+        const sandbox = process.env.AT_USERNAME === 'sandbox';
+        const corps = new URLSearchParams({ username: process.env.AT_USERNAME, to: numero, message: String(texte).slice(0, 480) });
+        if (process.env.AT_SENDER) corps.set('from', process.env.AT_SENDER);
+        const r = await fetch((sandbox ? 'https://api.sandbox.africastalking.com' : 'https://api.africastalking.com') + '/version1/messaging', {
+            method: 'POST',
+            headers: { apiKey: process.env.AT_API_KEY, Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: corps.toString()
+        });
+        if (!r.ok) console.warn('[SMS]', r.status, (await r.text().catch(() => '')).slice(0, 160));
+        return r.ok;
+    } catch (e) { console.warn('[SMS]', e.message); return false; }
+}
+
+/* ----- Paiement mobile (FedaPay : T-Money, Flooz…) ----- */
+// FEDAPAY_SECRET_KEY, FEDAPAY_ENV=sandbox|live, FEDAPAY_WEBHOOK_SECRET
+const fedapayActif = !!process.env.FEDAPAY_SECRET_KEY;
+const FEDAPAY_BASE = process.env.FEDAPAY_ENV === 'live' ? 'https://api.fedapay.com/v1' : 'https://sandbox-api.fedapay.com/v1';
+let FedaWebhook = null;
+try { FedaWebhook = require('fedapay').Webhook; } catch (e) { /* module absent : webhooks de paiement désactivés */ }
+const fedapayTraites = new Set();
+
+async function fedapayAppel(methode, chemin, corps) {
+    const r = await fetch(FEDAPAY_BASE + chemin, {
+        method: methode,
+        headers: { Authorization: 'Bearer ' + process.env.FEDAPAY_SECRET_KEY, 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: corps ? JSON.stringify(corps) : undefined
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error('FedaPay ' + r.status + ' ' + JSON.stringify(j).slice(0, 200));
+    return j;
+}
+const fedapayObjet = (j) => (j && (j['v1/transaction'] || j.transaction)) || j || {};
+
+const hoteRappelAutorise = (url) => {
+    try { const u = new URL(url); return u.protocol === 'https:' && HOTES_RAPPEL.includes(u.hostname.toLowerCase()); } catch (e) { return false; }
+};
+/** Prévient l'appli du partenaire (signature HMAC dans X-EVAT-Signature), 3 essais */
+async function rappelerPartenaire(url, cle, charge) {
+    const corps = JSON.stringify(charge);
+    const signature = 'sha256=' + crypto.createHmac('sha256', cle).update(corps).digest('hex');
+    for (let i = 0; i < 3; i++) {
+        try {
+            const ctl = new AbortController();
+            const t = setTimeout(() => ctl.abort(), 8000);
+            const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-EVAT-Signature': signature }, body: corps, signal: ctl.signal });
+            clearTimeout(t);
+            if (r.ok) return true;
+        } catch (e) { /* nouvel essai */ }
+        await new Promise(r => setTimeout(r, 2000 * (i + 1)));
+    }
+    return false;
+}
+
+async function traiterWebhookFedapay(req, res) {
+    if (!fedapayActif || !FedaWebhook || !process.env.FEDAPAY_WEBHOOK_SECRET) return res.status(503).send('paiement non configuré');
+    let event;
+    try {
+        event = FedaWebhook.constructEvent(req.body.toString('utf8'), req.headers['x-fedapay-signature'], process.env.FEDAPAY_WEBHOOK_SECRET);
+    } catch (e) { return res.status(400).send('signature invalide'); }
+    res.status(200).json({ received: true });             // on répond vite, puis on traite
+
+    try {
+        const nom = String(event.name || event.type || '');
+        if (!/^transaction\.(approved|declined|canceled)$/.test(nom)) return;
+        const brut = event.entity || event.data || event.object_data || {};
+        const id = (fedapayObjet(brut).id) || brut.id;
+        if (!id) return;
+        const cle = nom + ':' + id;
+        if (fedapayTraites.has(cle)) return;
+        fedapayTraites.add(cle);
+        if (fedapayTraites.size > 3000) fedapayTraites.delete(fedapayTraites.values().next().value);
+
+        // On relit la transaction chez FedaPay : source de vérité (statut, montant, métadonnées)
+        const tx = fedapayObjet(await fedapayAppel('GET', '/transactions/' + encodeURIComponent(id)));
+        const meta = tx.custom_metadata || {};
+        const partenaire = PARTENAIRES.find(p => p.nom === meta.partenaire);
+        if (!partenaire) return;
+        const statut = String(tx.status || '');
+        const montant = parseInt(tx.amount, 10) || 0;
+        const montantTxt = montant.toLocaleString('fr-FR').replace(/\s/g, ' ') + ' FCFA';
+
+        if (meta.evat_tel && statut === 'approved') livrerMessagePartenaire(partenaire, String(meta.evat_tel), '✅ Paiement de ' + montantTxt + ' reçu' + (tx.description ? ' — ' + tx.description : '') + '.');
+        else if (meta.evat_tel && (statut === 'declined' || statut === 'canceled')) livrerMessagePartenaire(partenaire, String(meta.evat_tel), '❌ Paiement de ' + montantTxt + ' non abouti (' + (statut === 'canceled' ? 'annulé' : 'refusé') + ').');
+
+        if (meta.callback_url && hoteRappelAutorise(meta.callback_url)) {
+            await rappelerPartenaire(meta.callback_url, partenaire.cle, {
+                event: 'payment.' + statut, payment_id: String(id), reference: tx.merchant_reference || meta.reference || null,
+                amount: montant, currency: 'XOF', status: statut, evat_tel: meta.evat_tel || null
+            });
+        }
+    } catch (e) { console.warn('[Webhook FedaPay]', e.message); }
+}
+
+/* ----- API partenaires (cantine, MikroTik, boutiques…) ----- */
+app.get('/api/v1/status', authPartenaire, (req, res) => {
+    res.json({ ok: true, partenaire: req.partenaire.nom, paiement: fedapayActif, sms: smsActif });
+});
+
+app.get('/api/v1/users/exists', authPartenaire, (req, res) => {
+    const tel = nettoyerTel(req.query.tel);
+    const u = tel && registeredUsers.get(tel);
+    res.json({ ok: true, exists: !!(u && !u.bloque) });
+});
+
+app.post('/api/v1/messages', authPartenaire, async (req, res) => {
+    const b = req.body || {};
+    const tel = nettoyerTel(b.to);
+    const texte = typeof b.text === 'string' ? b.text.trim() : '';
+    if (!tel || !telEstValide(tel) || !texte) return res.status(400).json({ ok: false, error: 'invalid_request' });
+    const msg = livrerMessagePartenaire(req.partenaire, tel, texte);
+    if (msg) return res.json({ ok: true, canal: 'evat', id: msg.id });
+    if (b.sms_fallback === true && smsActif) {
+        const ok = await envoyerSms(tel, texte);
+        return res.status(ok ? 200 : 502).json({ ok, canal: 'sms' });
+    }
+    res.status(404).json({ ok: false, error: 'not_registered' });
+});
+
+app.post('/api/v1/payments', authPartenaire, async (req, res) => {
+    if (!fedapayActif) return res.status(503).json({ ok: false, error: 'payments_disabled' });
+    const b = req.body || {};
+    const montant = parseInt(b.amount, 10);
+    if (!(montant >= 100 && montant <= 2000000)) return res.status(400).json({ ok: false, error: 'invalid_amount' });
+    const evatTel = b.to ? nettoyerTel(b.to) : null;
+    if (b.to && !(evatTel && registeredUsers.get(evatTel))) return res.status(404).json({ ok: false, error: 'not_registered' });
+    const client = b.customer || {};
+    const tel = client.phone ? nettoyerTel(client.phone) : evatTel;
+    try {
+        const corps = {
+            description: String(b.description || 'Paiement').slice(0, 120),
+            amount: montant,
+            currency: { iso: 'XOF' },
+            merchant_reference: b.reference ? String(b.reference).slice(0, 64) : undefined,
+            custom_metadata: {
+                partenaire: req.partenaire.nom, evat_tel: evatTel || null, reference: b.reference ? String(b.reference).slice(0, 64) : null,
+                callback_url: (b.callback_url && hoteRappelAutorise(String(b.callback_url))) ? String(b.callback_url) : null
+            },
+            customer: {
+                firstname: String(client.firstname || (evatTel && registeredUsers.get(evatTel).nom) || 'Client').slice(0, 60),
+                lastname: String(client.lastname || 'EVAT').slice(0, 60),
+                email: client.email ? String(client.email).slice(0, 120) : undefined,
+                phone_number: tel ? { number: tel, country: 'tg' } : undefined
+            }
+        };
+        const tx = fedapayObjet(await fedapayAppel('POST', '/transactions', corps));
+        if (!tx.id) throw new Error('transaction sans identifiant');
+        const jeton = await fedapayAppel('POST', '/transactions/' + tx.id + '/token');
+        res.json({ ok: true, payment_id: String(tx.id), url: jeton.url || (jeton.token ? null : null), token: jeton.token || null,
+                   callback_ignored: !!(b.callback_url && !corps.custom_metadata.callback_url) });
+    } catch (e) {
+        console.warn('[Paiement]', e.message);
+        res.status(502).json({ ok: false, error: 'provider_error' });
+    }
+});
+
+app.get('/api/v1/payments/:id', authPartenaire, async (req, res) => {
+    if (!fedapayActif) return res.status(503).json({ ok: false, error: 'payments_disabled' });
+    try {
+        const tx = fedapayObjet(await fedapayAppel('GET', '/transactions/' + encodeURIComponent(req.params.id)));
+        if (!tx.custom_metadata || tx.custom_metadata.partenaire !== req.partenaire.nom) return res.status(404).json({ ok: false, error: 'not_found' });
+        res.json({ ok: true, payment_id: String(tx.id), status: tx.status, amount: tx.amount, reference: tx.merchant_reference || null });
+    } catch (e) { res.status(502).json({ ok: false, error: 'provider_error' }); }
 });
 
 app.get('/health', (req, res) => res.status(200).send('ok'));
