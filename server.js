@@ -141,7 +141,7 @@ function loadData() {
         (raw.users || []).forEach(u => {
             registeredUsers.set(u.tel, {
                 nom: u.nom, metier: u.metier,
-                pinHash: u.pinHash, pinSalt: u.pinSalt,
+                pinHash: u.pinHash, pinSalt: u.pinSalt, emailRecup: u.emailRecup || '', recupAt: u.recupAt || 0,
                 createdAt: u.createdAt, lastSeen: u.lastSeen || u.createdAt,
                 push: u.push || null, bloque: !!u.bloque, adminNote: u.adminNote || '', avertissement: !!u.avertissement, online: false, hidden: false, socketId: null
             });
@@ -170,7 +170,7 @@ function saveDataNow() {
         for (const [tel, u] of registeredUsers) {
             users.push({
                 tel, nom: u.nom, metier: u.metier, pinHash: u.pinHash,
-                pinSalt: u.pinSalt, createdAt: u.createdAt, lastSeen: u.lastSeen, push: u.push || null, bloque: !!u.bloque, adminNote: u.adminNote || '', avertissement: !!u.avertissement
+                pinSalt: u.pinSalt, emailRecup: u.emailRecup || '', recupAt: u.recupAt || 0, createdAt: u.createdAt, lastSeen: u.lastSeen, push: u.push || null, bloque: !!u.bloque, adminNote: u.adminNote || '', avertissement: !!u.avertissement
             });
         }
         const tmp = DATA_FILE + '.tmp';
@@ -211,7 +211,7 @@ async function upstash(commande, pipeline) {
 }
 
 function jsonUtilisateur(u) {       // sans « lastSeen » : il change sans cesse et ferait écrire pour rien
-    return JSON.stringify({ nom: u.nom, metier: u.metier, pinHash: u.pinHash, pinSalt: u.pinSalt, createdAt: u.createdAt, push: u.push || null, bloque: !!u.bloque, adminNote: u.adminNote || '', avertissement: !!u.avertissement, statut: normaliserStatut(u.statut) });
+    return JSON.stringify({ nom: u.nom, metier: u.metier, pinHash: u.pinHash, pinSalt: u.pinSalt, emailRecup: u.emailRecup || '', recupAt: u.recupAt || 0, createdAt: u.createdAt, push: u.push || null, bloque: !!u.bloque, adminNote: u.adminNote || '', avertissement: !!u.avertissement, statut: normaliserStatut(u.statut) });
 }
 
 async function chargerDepuisUpstash() {
@@ -223,7 +223,7 @@ async function chargerDepuisUpstash() {
             try {
                 const u = JSON.parse(plat[i + 1]);
                 registeredUsers.set(plat[i], {
-                    nom: u.nom, metier: u.metier, pinHash: u.pinHash, pinSalt: u.pinSalt,
+                    nom: u.nom, metier: u.metier, pinHash: u.pinHash, pinSalt: u.pinSalt, emailRecup: u.emailRecup || '', recupAt: u.recupAt || 0,
                     createdAt: u.createdAt, lastSeen: u.createdAt, push: u.push || null, bloque: !!u.bloque, adminNote: u.adminNote || '', avertissement: !!u.avertissement,
                     online: false, hidden: false, socketId: null
                 });
@@ -870,14 +870,16 @@ function planifierCompteur() {
     }, 2000);
 }
 
-function lierSocket(socket, tel, user) {
+function lierSocket(socket, tel, user, raison) {
     // Éjecte l'ancien appareil (1 compte = 1 appareil actif)
     if (user.socketId && user.socketId !== socket.id) {
         const old = io.sockets.sockets.get(user.socketId);
         if (old) {
             old.emit('force_logout', {
-                reason: 'session_taken',
-                message: 'Votre compte a été ouvert sur un autre appareil. Vous avez été déconnecté automatiquement.'
+                reason: raison === 'recovered' ? 'recovered' : 'session_taken',
+                message: raison === 'recovered'
+                    ? 'Votre compte a été récupéré sur un autre téléphone. Cet appareil a été déconnecté et ses données locales supprimées.'
+                    : 'Votre compte a été ouvert sur un autre appareil. Vous avez été déconnecté automatiquement.'
             });
             old.leave(roomUser(tel));
             old.telephone = null;
@@ -1131,6 +1133,92 @@ async function verifierTurn(url, utilisateur, motDePasse) {
     } finally { canal.fermer(); }
 }
 
+
+/* ============================================================
+   RÉCUPÉRATION PAR CODE (SMS / e-mail) + SAUVEGARDE COMPLÈTE DU COMPTE
+   SMS : AT_USERNAME, AT_API_KEY   ·   E-mail : BREVO_API_KEY, MAIL_FROM (expéditeur validé chez Brevo), MAIL_FROM_NAME
+   Sauvegarde : Upstash (si actif) + fichier du serveur ; BACKUP_KEY (16 car. min.) = chiffrement AES-256-GCM au repos
+   ============================================================ */
+const zlib = require('zlib');
+const mailActif = !!(process.env.BREVO_API_KEY && process.env.MAIL_FROM);
+async function envoyerEmail(destinataire, sujet, texte) {
+    if (!mailActif) return false;
+    try {
+        const r = await fetch('https://api.brevo.com/v3/smtp/email', {
+            method: 'POST',
+            headers: { 'api-key': process.env.BREVO_API_KEY, 'Content-Type': 'application/json', Accept: 'application/json' },
+            body: JSON.stringify({ sender: { name: process.env.MAIL_FROM_NAME || 'EVAT', email: process.env.MAIL_FROM }, to: [{ email: destinataire }], subject: sujet, textContent: texte })
+        });
+        if (!r.ok) console.warn('[Mail]', r.status, (await r.text().catch(() => '')).slice(0, 160));
+        return r.ok;
+    } catch (e) { console.warn('[Mail]', e.message); return false; }
+}
+const emailValide = e => /^[^\s@]{1,64}@[^\s@]{1,190}\.[^\s@]{2,}$/.test(String(e || '')) && String(e).length <= 120;
+const masquerEmail = e => { const [a, b] = String(e).split('@'); return (a.slice(0, 1) || '') + '***@' + b; };
+const masquerTel = t => String(t).slice(0, 4) + ' ****' + String(t).slice(-2);
+
+// Codes à usage unique (6 chiffres, 10 min, 5 essais) : seul leur condensé est gardé en mémoire
+const codesOtp = new Map();     // clé → { hash, sel, exp, essais, email? }
+const envoisOtp = new Map();    // tel → [horodatages]
+function creerOtp(cle, extra) {
+    const code = String(crypto.randomInt(100000, 1000000));
+    const sel = crypto.randomBytes(8).toString('hex');
+    codesOtp.set(cle, Object.assign({ hash: crypto.createHash('sha256').update(sel + code).digest('hex'), sel, exp: Date.now() + 10 * 60000, essais: 0 }, extra || {}));
+    return code;
+}
+function verifierOtp(cle, code) {
+    const o = codesOtp.get(cle);
+    if (!o || o.exp < Date.now()) { codesOtp.delete(cle); return { ok: false, raison: 'expire' }; }
+    if (++o.essais > 5) { codesOtp.delete(cle); return { ok: false, raison: 'trop' }; }
+    const h = crypto.createHash('sha256').update(o.sel + String(code || '').trim()).digest();
+    if (!crypto.timingSafeEqual(h, Buffer.from(o.hash, 'hex'))) return { ok: false, raison: 'mauvais' };
+    codesOtp.delete(cle);
+    return { ok: true, o };
+}
+function envoiAutorise(tel) {
+    const maintenant = Date.now();
+    const l = (envoisOtp.get(tel) || []).filter(t => maintenant - t < 3600000);
+    if (l.length >= 5 || (l.length && maintenant - l[l.length - 1] < 60000)) return false;
+    l.push(maintenant); envoisOtp.set(tel, l);
+    return true;
+}
+setInterval(() => { const n = Date.now(); codesOtp.forEach((o, k) => { if (o.exp < n) codesOtp.delete(k); }); }, 5 * 60000);
+
+// Sauvegarde : compression + chiffrement facultatif
+const BACKUP_DIR = path.join(DATA_DIR, 'backups');
+const backupCle = (() => { const k = process.env.BACKUP_KEY || ''; return k.length >= 16 ? crypto.scryptSync(k, 'evat-backup-v1', 32) : null; })();
+function backupEncoder(texte) {
+    const brut = zlib.gzipSync(Buffer.from(texte, 'utf8'));
+    if (!backupCle) return Buffer.concat([Buffer.from([1]), brut]).toString('base64');
+    const iv = crypto.randomBytes(12);
+    const c = crypto.createCipheriv('aes-256-gcm', backupCle, iv);
+    const enc = Buffer.concat([c.update(brut), c.final()]);
+    return Buffer.concat([Buffer.from([2]), iv, c.getAuthTag(), enc]).toString('base64');
+}
+function backupDecoder(b64) {
+    const buf = Buffer.from(b64, 'base64');
+    let brut;
+    if (buf[0] === 1) brut = buf.slice(1);
+    else if (buf[0] === 2) {
+        if (!backupCle) throw new Error('clé de chiffrement absente');
+        const d = crypto.createDecipheriv('aes-256-gcm', backupCle, buf.slice(1, 13));
+        d.setAuthTag(buf.slice(13, 29));
+        brut = Buffer.concat([d.update(buf.slice(29)), d.final()]);
+    } else throw new Error('format inconnu');
+    return zlib.gunzipSync(brut).toString('utf8');
+}
+const fichierBackup = tel => path.join(BACKUP_DIR, crypto.createHash('sha256').update(tel).digest('hex').slice(0, 32) + '.bak');
+async function backupEcrire(tel, b64) {
+    try { fs.mkdirSync(BACKUP_DIR, { recursive: true }); const f = fichierBackup(tel); fs.writeFileSync(f + '.tmp', b64); fs.renameSync(f + '.tmp', f); } catch (e) { console.warn('[Backup fichier]', e.message); }
+    if (upstashActif) await upstash(['HSET', 'evat:backups', tel, b64]);
+}
+async function backupLire(tel) {
+    let b64 = null;
+    if (upstashActif) { try { b64 = await upstash(['HGET', 'evat:backups', tel]); } catch (e) { console.warn('[Backup Upstash]', e.message); } }
+    if (!b64) { try { b64 = fs.readFileSync(fichierBackup(tel), 'utf8'); } catch (e) { /* aucune */ } }
+    return b64 || null;
+}
+
 /* ---------------- Socket.io ---------------- */
 const masque = t => '***' + String(t || '').slice(-3);
 const logAppel = (evt, de, vers, id, extra) =>
@@ -1220,7 +1308,8 @@ io.on('connection', (socket) => {
         const nouveauPin = genererPin();
         Object.assign(user, hashPin(nouveauPin));
         if (data.metier && String(data.metier).trim()) user.metier = String(data.metier).trim().slice(0, 80);
-        lierSocket(socket, tel, user);
+        user.recupAt = Date.now();
+        lierSocket(socket, tel, user, 'recovered');
         saveDataSoon();
         console.log(`[RECOVER OK] ${user.nom} (${tel})`);
 
@@ -1253,7 +1342,7 @@ io.on('connection', (socket) => {
                 return ack(cb, { ok: true });
             }
             noterEchec(cleTel);
-            return ack(cb, { ok: false, needsRecovery: true, error: 'Ce numéro appartient déjà à un compte. Utilisez le code de récupération.' });
+            return ack(cb, { ok: false, needsRecovery: true, revoque: !!(existing.recupAt && data.recoveryPin), error: 'Ce numéro appartient déjà à un compte. Utilisez le code de récupération.' });
         }
 
         // Serveur redémarré sans disque persistant : on recrée le compte depuis le client (PIN obligatoire)
@@ -1781,6 +1870,123 @@ io.on('connection', (socket) => {
         io.to(roomWatch(me)).emit('statut_retire', { from: me, id: String(d.id) });
         saveDataSoon();
         ack(cb, { ok: true });
+    });
+
+    /* ----- E-mail de récupération (à vérifier avant usage) ----- */
+    socket.on('email_recup_envoyer', async (d, cb) => {
+        const tel = socket.telephone, u = tel && registeredUsers.get(tel);
+        if (!u) return ack(cb, { ok: false, error: 'Non connecté.' });
+        if (!limiteur(socket, 'mail_otp', 5, 3600000)) return ack(cb, { ok: false, error: 'Trop de demandes, réessayez plus tard.' });
+        const email = String((d && d.email) || '').trim().toLowerCase();
+        if (!emailValide(email)) return ack(cb, { ok: false, error: 'Adresse e-mail invalide.' });
+        if (!mailActif) return ack(cb, { ok: false, error: 'L’envoi d’e-mails n’est pas encore activé sur le serveur.' });
+        const code = creerOtp('mail:' + tel, { email });
+        const ok = await envoyerEmail(email, 'EVAT : confirmez votre e-mail', 'Votre code de confirmation EVAT est ' + code + '.\nIl est valable 10 minutes. Ne le communiquez à personne.');
+        if (!ok) { codesOtp.delete('mail:' + tel); return ack(cb, { ok: false, error: 'E-mail non envoyé. Vérifiez l’adresse.' }); }
+        ack(cb, { ok: true, destinataire: masquerEmail(email) });
+    });
+    socket.on('email_recup_confirmer', (d, cb) => {
+        const tel = socket.telephone, u = tel && registeredUsers.get(tel);
+        if (!u) return ack(cb, { ok: false, error: 'Non connecté.' });
+        if (!limiteur(socket, 'mail_conf', 10, 600000)) return ack(cb, { ok: false, error: 'Trop d’essais.' });
+        const r = verifierOtp('mail:' + tel, d && d.code);
+        if (!r.ok) return ack(cb, { ok: false, error: r.raison === 'mauvais' ? 'Code incorrect.' : 'Code expiré : demandez-en un nouveau.' });
+        u.emailRecup = r.o.email;
+        saveDataSoon();
+        ack(cb, { ok: true, email: masquerEmail(u.emailRecup) });
+    });
+    socket.on('recup_canaux', (_, cb) => {
+        const u = socket.telephone && registeredUsers.get(socket.telephone);
+        if (!u) return ack(cb, { ok: false });
+        ack(cb, { ok: true, email: u.emailRecup ? masquerEmail(u.emailRecup) : null, emailDispo: mailActif, smsDispo: smsActif, backupChiffre: !!backupCle });
+    });
+
+    /* ----- Récupération du compte sur un nouveau téléphone, par code reçu sur le numéro (SMS) ou l'e-mail vérifié ----- */
+    socket.on('recup_code_demander', async (d, cb) => {
+        const tel = nettoyerTel(d && d.telephone);
+        const canal = d && d.canal === 'email' ? 'email' : 'sms';
+        if (!limiteur(socket, 'recup_otp', 8, 3600000)) return ack(cb, { ok: false, error: 'Trop de demandes. Réessayez dans une heure.' });
+        if (!telEstValide(tel)) return ack(cb, { ok: false, error: 'Numéro invalide.' });
+        const u = registeredUsers.get(tel);
+        const refus = { ok: false, error: 'Impossible d’envoyer un code pour ce numéro avec ce moyen.' };
+        if (!u || u.bloque) return ack(cb, refus);
+        if (estBloque('tel:' + tel)) return ack(cb, { ok: false, error: 'Trop d’essais. Réessayez dans 15 minutes.' });
+        if (canal === 'email' && !(u.emailRecup && mailActif)) return ack(cb, refus);
+        if (canal === 'sms' && !smsActif) return ack(cb, { ok: false, error: 'L’envoi de SMS n’est pas encore activé : utilisez l’e-mail ou votre code secret.' });
+        if (!envoiAutorise(tel)) return ack(cb, { ok: false, error: 'Un code vient d’être envoyé. Patientez une minute avant d’en demander un autre.' });
+        const code = creerOtp('rec:' + tel);
+        const texte = 'EVAT : votre code de récupération est ' + code + ' (valable 10 min). Ne le partagez jamais.';
+        const ok = canal === 'email' ? await envoyerEmail(u.emailRecup, 'EVAT : votre code de récupération', texte) : await envoyerSms(tel, texte);
+        if (!ok) { codesOtp.delete('rec:' + tel); return ack(cb, { ok: false, error: 'Envoi impossible pour le moment. Réessayez.' }); }
+        console.log('[RECUP] code envoyé (' + canal + ') ' + masque(tel));
+        ack(cb, { ok: true, canal, destinataire: canal === 'email' ? masquerEmail(u.emailRecup) : masquerTel(tel) });
+    });
+
+    socket.on('recup_code_verifier', (d, cb) => {
+        const tel = nettoyerTel(d && d.telephone);
+        const cleIp = 'ip:' + ipDe(socket), cleTel = 'tel:' + tel;
+        if (estBloque(cleIp) || estBloque(cleTel)) return ack(cb, { ok: false, error: 'Trop d’essais. Réessayez dans 15 minutes.' });
+        const u = registeredUsers.get(tel);
+        if (!u || u.bloque) return ack(cb, { ok: false, error: 'Code incorrect ou expiré.' });
+        const r = verifierOtp('rec:' + tel, d && d.code);
+        if (!r.ok) {
+            noterEchec(cleIp, 30); noterEchec(cleTel, 5);
+            return ack(cb, { ok: false, error: r.raison === 'mauvais' ? 'Code incorrect.' : 'Code expiré : demandez-en un nouveau.' });
+        }
+        effacerEchecs(cleTel);
+        const nouveauPin = genererPin();                  // nouveau code secret : l'ancien téléphone n'est plus reconnu
+        Object.assign(u, hashPin(nouveauPin));
+        u.recupAt = Date.now();
+        lierSocket(socket, tel, u, 'recovered');           // déconnecte l'ancien appareil s'il est en ligne
+        saveDataSoon();
+        console.log('[RECOVER OTP OK] ' + u.nom + ' (' + masque(tel) + ')');
+        ack(cb, {
+            ok: true, recoveryPin: nouveauPin, profil: { nom: u.nom, telephone: tel, metier: u.metier },
+            message: 'Compte récupéré. L’ancien téléphone est déconnecté. Notez votre NOUVEAU code secret.'
+        });
+    });
+
+    /* ----- Sauvegarde complète du compte (par morceaux : la limite d'un message est de 600 Ko) ----- */
+    socket.on('backup_envoyer', async (d, cb) => {
+        const tel = socket.telephone;
+        if (!tel || !d) return ack(cb, { ok: false, error: 'Non connecté.' });
+        if (!limiteur(socket, 'backup_env', 40, 600000)) return ack(cb, { ok: false, error: 'Trop de sauvegardes, patientez.' });
+        const part = parseInt(d.part, 10), total = parseInt(d.total, 10);
+        if (!(total >= 1 && total <= 12) || !(part >= 0 && part < total) || typeof d.data !== 'string' || d.data.length > 400000) return ack(cb, { ok: false, error: 'Morceau invalide.' });
+        if (part === 0 || !socket._bk || socket._bk.total !== total) socket._bk = { total, parts: [] };
+        socket._bk.parts[part] = d.data;
+        if (part < total - 1) return ack(cb, { ok: true, suite: true });
+        if (socket._bk.parts.length !== total || socket._bk.parts.some(x => typeof x !== 'string')) { socket._bk = null; return ack(cb, { ok: false, error: 'Sauvegarde incomplète.' }); }
+        const texte = socket._bk.parts.join('');
+        socket._bk = null;
+        try {
+            const obj = JSON.parse(texte);
+            if (!obj || obj.v !== 1) throw new Error('format');
+            const b64 = backupEncoder(texte);
+            if (b64.length > 900000) return ack(cb, { ok: false, error: 'Sauvegarde trop volumineuse.' });
+            await backupEcrire(tel, b64);
+            const u = registeredUsers.get(tel); if (u) u.backupAt = Date.now();
+            ack(cb, { ok: true, at: Date.now(), taille: b64.length });
+        } catch (e) { console.warn('[Backup]', e.message); ack(cb, { ok: false, error: 'Sauvegarde refusée.' }); }
+    });
+    socket.on('backup_restaurer', async (d, cb) => {
+        const tel = socket.telephone;
+        if (!tel) return ack(cb, { ok: false, error: 'Non connecté.' });
+        if (!limiteur(socket, 'backup_res', 40, 600000)) return ack(cb, { ok: false, error: 'Trop de requêtes.' });
+        try {
+            const b64 = await backupLire(tel);
+            if (!b64) return ack(cb, { ok: true, aucune: true });
+            const texte = backupDecoder(b64);
+            const TAILLE = 300000, total = Math.max(1, Math.ceil(texte.length / TAILLE));
+            const part = Math.max(0, Math.min(total - 1, parseInt(d && d.part, 10) || 0));
+            ack(cb, { ok: true, part, total, data: texte.slice(part * TAILLE, (part + 1) * TAILLE) });
+        } catch (e) { console.warn('[Backup restauration]', e.message); ack(cb, { ok: false, error: 'Sauvegarde illisible.' }); }
+    });
+    socket.on('backup_info', async (_, cb) => {
+        const tel = socket.telephone;
+        if (!tel) return ack(cb, { ok: false });
+        const b64 = await backupLire(tel);
+        ack(cb, { ok: true, existe: !!b64, taille: b64 ? b64.length : 0, chiffre: !!backupCle, persistant: upstashActif });
     });
 
     /* ----- Groupes légers ----- */
