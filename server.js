@@ -76,6 +76,30 @@ const activeCalls = new Map();   // tel → { peer, callId, since }
 const failedAttempts = new Map(); // clé → { count, until }
 const pendingCalls = new Map();  // tel du destinataire → { callId, from, signals[], expires, acked }
 let vapid = null;                // { publicKey, privateKey }
+// Marché (ex-ELOSIA) : annonces, commandes de publicité, réglages. Les photos sont stockées à part.
+const MARCHE_FORFAITS = [
+    { id: 'basic', nom: 'Basic', jours: 7, prix: 5000, slots: 1, desc: '1 annonce mise en avant 7 jours' },
+    { id: 'pro', nom: 'Pro', jours: 15, prix: 12000, slots: 3, desc: '3 annonces mises en avant 15 jours' },
+    { id: 'premium', nom: 'Premium', jours: 30, prix: 25000, slots: 10, desc: '10 annonces en tête de liste 30 jours' }
+];
+const marche = { annonces: [], commandes: [], params: { fraisPublication: 0, quotaGratuit: 3, forfaits: MARCHE_FORFAITS.map(f => Object.assign({}, f)) } };
+const MARCHE_MAX_ANNONCES = 1500, MARCHE_MAX_PAR_USER = 20, MARCHE_IMAGE_MAX = 150000;
+const marcheJson = () => JSON.stringify({ annonces: marche.annonces, commandes: marche.commandes.slice(-300), params: marche.params });
+function marcheDepuisJson(txt) {
+    try {
+        const j = typeof txt === 'string' ? JSON.parse(txt) : txt;
+        (j.annonces || []).forEach(a => { if (a && a.id && a.userTel && !marche.annonces.some(x => x.id === a.id)) marche.annonces.push(a); });
+        (j.commandes || []).forEach(c => { if (c && c.id && !marche.commandes.some(x => x.id === c.id)) marche.commandes.push(c); });
+        if (j.params && typeof j.params === 'object' && !marche.params._charge) {
+            const p = j.params;
+            if (Number.isFinite(p.fraisPublication)) marche.params.fraisPublication = Math.max(0, Math.min(100000, p.fraisPublication));
+            if (Number.isFinite(p.quotaGratuit)) marche.params.quotaGratuit = Math.max(0, Math.min(1000, p.quotaGratuit));
+            if (Array.isArray(p.forfaits)) p.forfaits.forEach(f => { const c = marche.params.forfaits.find(x => x.id === f.id); if (c) { c.prix = Math.max(0, Math.min(1000000, +f.prix || c.prix)); c.jours = Math.max(1, Math.min(365, +f.jours || c.jours)); c.slots = Math.max(1, Math.min(50, +f.slots || c.slots)); } });
+            marche.params._charge = true;
+        }
+    } catch (e) { /* illisible : ignoré */ }
+}
+
 // Statuts de 24 h (texte sur fond coloré ou photo) : { id, from, texte, bg, image, ts, vues: [tel] }
 const statuts = [];
 const STATUT_DUREE = 24 * 3600 * 1000, STATUT_MAX_PAR_USER = 10, STATUT_MAX_TOTAL = 400;
@@ -150,6 +174,7 @@ function loadData() {
         (raw.messages || []).forEach(m => messageHistory.push(m));
         if (raw.vapid && raw.vapid.publicKey) vapid = raw.vapid;
         if (Array.isArray(raw.statuts)) statutsDepuisJson(JSON.stringify(raw.statuts));
+        if (raw.marche) marcheDepuisJson(raw.marche);
         if (Array.isArray(raw.attente)) raw.attente.forEach(([t, liste]) => (liste || []).forEach(o => ajouterAttente(String(o), String(t))));
         console.log(`💾 ${registeredUsers.size} comptes chargés`);
     } catch (e) { /* premier démarrage */ }
@@ -174,7 +199,7 @@ function saveDataNow() {
             });
         }
         const tmp = DATA_FILE + '.tmp';
-        fs.writeFileSync(tmp, JSON.stringify({ users, supprimes: [...supprimes], vapid, messages: messageHistory.slice(-MAX_HISTORY), attente: [...attenteInscription].map(([t, set]) => [t, [...set]]), statuts }));
+        fs.writeFileSync(tmp, JSON.stringify({ users, supprimes: [...supprimes], vapid, messages: messageHistory.slice(-MAX_HISTORY), attente: [...attenteInscription].map(([t, set]) => [t, [...set]]), statuts, marche: JSON.parse(marcheJson()) }));
         fs.renameSync(tmp, DATA_FILE);
     } catch (e) {
         console.warn('Sauvegarde impossible :', e.message);
@@ -196,7 +221,7 @@ const upstashActif = !!(UP_URL && UP_TOKEN);
 const upUrlValide = (() => { try { return new URL(UP_URL).protocol === 'https:'; } catch (e) { return false; } })();
 const upFile = [];      // commandes en attente (suppressions de comptes)
 const upDerniers = new Map();      // tel -> dernier JSON enregistré (on n'écrit que ce qui change)
-let upStatutsJson = '', upAttenteJson = '', upMessagesJson = '', upMessagesT = 0, upTimer = null, upEtat = { ok: null, erreur: '', comptes: 0 };
+let upMarcheJson = '', upStatutsJson = '', upAttenteJson = '', upMessagesJson = '', upMessagesT = 0, upTimer = null, upEtat = { ok: null, erreur: '', comptes: 0 };
 
 async function upstash(commande, pipeline) {
     const r = await fetch(UP_URL + (pipeline ? '/pipeline' : ''), {
@@ -237,6 +262,11 @@ async function chargerDepuisUpstash() {
         if (msgs) {
             try { JSON.parse(msgs).forEach(m => messageHistory.push(m)); upMessagesJson = msgs; } catch (e) {}
         }
+        // Marché : annonces, commandes de pub, réglages (les photos sont dans un autre champ Upstash)
+        try {
+            const mj = await upstash(['GET', 'evat:marche']);
+            if (mj) { marcheDepuisJson(mj); upMarcheJson = marcheJson(); }
+        } catch (e) { console.warn('[Upstash] marché :', e.message); }
         // Statuts 24 h (texte seulement : les photos restent dans le fichier local du serveur)
         try {
             const st = await upstash(['GET', 'evat:statuts']);
@@ -296,6 +326,8 @@ async function upstashEnvoyer() {
         const mj = JSON.stringify(messageHistory.slice(-MAX_HISTORY));
         if (mj !== upMessagesJson) { cmds.push(['SET', 'evat:messages', mj]); suites.push(() => { upMessagesJson = mj; upMessagesT = Date.now(); }); }
     }
+    const mjs = marcheJson();
+    if (mjs !== upMarcheJson) { cmds.push(['SET', 'evat:marche', mjs]); suites.push(() => { upMarcheJson = mjs; }); }
     purgerStatuts();
     const sj = statutsVersJson(false);
     if (sj !== upStatutsJson) { cmds.push(['SET', 'evat:statuts', sj, 'EX', 90000]); suites.push(() => { upStatutsJson = sj; }); }
@@ -1276,6 +1308,204 @@ function lireReponseTraduction(brut) {
     } catch (e) { return null; }
 }
 
+/* ============================================================
+   RECHERCHE MÉTIER SUR INTERNET (sans IA : on renvoie de vrais résultats de moteur de recherche)
+   BRAVE_API_KEY (recommandé) : web + images + vidéos.  Sans clé : Wikipédia + Wikimedia Commons (gratuit, sans clé).
+   ============================================================ */
+const BRAVE_KEY = String(process.env.BRAVE_API_KEY || '').trim();
+const rechercheActive = true;
+const cacheRecherche = new Map();       // clé → { at, data } : 30 min, pour économiser le quota
+const quotaRecherche = new Map();       // tel → { jour, n }
+const RECH_MAX_PAR_JOUR = 80;
+const RECH_LANGUES_BRAVE = { fr: 'fr', en: 'en', es: 'es', pt: 'pt-pt', de: 'de', it: 'it', ar: 'ar', zh: 'zh-hans' };
+const RECH_PAYS_BRAVE = new Set(['FR', 'BE', 'CH', 'CA', 'ZA', 'US', 'GB', 'DE', 'ES', 'IT', 'PT', 'BR', 'NL', 'MX', 'IN', 'AU']);
+const UA_RECH = 'EVAT/1.0 (recherche metier; contact: admin)';
+
+const nettoyerTexteWeb = (t, max) => String(t || '').replace(/<[^>]*>/g, '').replace(/&quot;/g, '"').replace(/&#x27;|&#39;/g, "'").replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/\s+/g, ' ').trim().slice(0, max || 300);
+const urlWebSure = (u) => { try { const x = new URL(String(u)); return (x.protocol === 'http:' || x.protocol === 'https:') ? x.toString() : ''; } catch (e) { return ''; } };
+
+async function appelJson(url, entetes, ms) {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), ms || 9000);
+    try {
+        const r = await fetch(url, { headers: Object.assign({ Accept: 'application/json', 'User-Agent': UA_RECH }, entetes || {}), signal: ctl.signal });
+        if (!r.ok) { const e = new Error('HTTP ' + r.status); e.status = r.status; throw e; }
+        return await r.json();
+    } finally { clearTimeout(t); }
+}
+
+async function rechercheBrave(type, q, lang, pays) {
+    const chemin = type === 'images' ? 'images/search' : type === 'videos' ? 'videos/search' : 'web/search';
+    const base = new URLSearchParams({ q, count: type === 'images' ? '24' : '10', safesearch: 'moderate' });
+    const complet = new URLSearchParams(base);
+    if (RECH_LANGUES_BRAVE[lang] && type !== 'images') complet.set('search_lang', RECH_LANGUES_BRAVE[lang]);
+    if (pays && RECH_PAYS_BRAVE.has(pays)) complet.set('country', pays);
+    const entetes = { 'X-Subscription-Token': BRAVE_KEY };
+    let j;
+    try { j = await appelJson('https://api.search.brave.com/res/v1/' + chemin + '?' + complet, entetes); }
+    catch (e) { if (e.status === 422 || e.status === 400) j = await appelJson('https://api.search.brave.com/res/v1/' + chemin + '?' + base, entetes); else throw e; }
+    if (type === 'images') {
+        return (j.results || []).map(r => ({
+            titre: nettoyerTexteWeb(r.title, 120), page: urlWebSure(r.url), source: nettoyerTexteWeb(r.source || (r.meta_url && r.meta_url.hostname), 60),
+            image: urlWebSure(r.thumbnail && r.thumbnail.src), original: urlWebSure(r.properties && r.properties.url)
+        })).filter(r => r.page && r.image).slice(0, 24);
+    }
+    if (type === 'videos') {
+        return (j.results || []).map(r => ({
+            titre: nettoyerTexteWeb(r.title, 140), url: urlWebSure(r.url), extrait: nettoyerTexteWeb(r.description, 220),
+            site: nettoyerTexteWeb(r.meta_url && r.meta_url.hostname, 60), image: urlWebSure(r.thumbnail && r.thumbnail.src),
+            duree: nettoyerTexteWeb(r.video && r.video.duration, 12), age: nettoyerTexteWeb(r.age, 40)
+        })).filter(r => r.url).slice(0, 10);
+    }
+    return ((j.web && j.web.results) || []).map(r => ({
+        titre: nettoyerTexteWeb(r.title, 140), url: urlWebSure(r.url), extrait: nettoyerTexteWeb(r.description, 300),
+        site: nettoyerTexteWeb(r.meta_url && r.meta_url.hostname, 60), image: urlWebSure(r.thumbnail && r.thumbnail.src), age: nettoyerTexteWeb(r.age, 40)
+    })).filter(r => r.url).slice(0, 10);
+}
+
+async function rechercheWikipedia(q, lang) {
+    const l = ['fr', 'en', 'es', 'pt', 'de', 'it', 'ar'].includes(lang) ? lang : 'fr';
+    const j = await appelJson('https://' + l + '.wikipedia.org/w/api.php?' + new URLSearchParams({ action: 'query', list: 'search', srsearch: q, srlimit: '8', format: 'json', utf8: '1' }));
+    return ((j.query && j.query.search) || []).map(r => ({
+        titre: nettoyerTexteWeb(r.title, 140), url: 'https://' + l + '.wikipedia.org/wiki/' + encodeURIComponent(String(r.title).replace(/ /g, '_')),
+        extrait: nettoyerTexteWeb(r.snippet, 300), site: l + '.wikipedia.org', image: '', age: ''
+    }));
+}
+
+async function rechercheCommons(q) {
+    const j = await appelJson('https://commons.wikimedia.org/w/api.php?' + new URLSearchParams({
+        action: 'query', generator: 'search', gsrsearch: q + ' filetype:bitmap', gsrnamespace: '6', gsrlimit: '24', prop: 'imageinfo',
+        iiprop: 'url|extmetadata', iiurlwidth: '360', format: 'json', utf8: '1' }));
+    const pages = Object.values((j.query && j.query.pages) || {});
+    return pages.map(p => {
+        const ii = (p.imageinfo || [])[0] || {};
+        const lic = ii.extmetadata && ii.extmetadata.LicenseShortName && ii.extmetadata.LicenseShortName.value;
+        return { titre: nettoyerTexteWeb(String(p.title || '').replace(/^File:/, '').replace(/\.[a-z0-9]+$/i, '').replace(/_/g, ' '), 120),
+                 page: urlWebSure(ii.descriptionurl), source: 'Wikimedia Commons' + (lic ? ' · ' + nettoyerTexteWeb(lic, 30) : ''),
+                 image: urlWebSure(ii.thumburl), original: urlWebSure(ii.url) };
+    }).filter(r => r.page && r.image).slice(0, 24);
+}
+
+/* ============================================================
+   MARCHÉ (ex-ELOSIA fusionné dans EVAT) : annonces, frais de publication, publicité, paiement réel FedaPay
+   Corrections par rapport à ELOSIA : comptes EVAT (téléphone), paiement jamais déclaré côté client,
+   photos bornées, modération, plafonds, aucune base de données exposée.
+   ============================================================ */
+const MARCHE_SERVICE = { nom: 'marche', label: '🛒 Marché EVAT' };
+const MARCHE_TYPES = ['agro', 'boutique', 'service', 'besoin'];
+const MARCHE_DUREES = [7, 15, 30, 60, 90];
+const MARCHE_PAIEMENTS = ['T-Money', 'Flooz', 'Espèces', 'PayPal'];
+const imagesMarche = new Map();    // cache mémoire des photos (100 max)
+const dossierImagesMarche = path.join(DATA_DIR, 'marche-img');
+
+const marcheActive = (a) => a.statut === 'active' && a.expiresAt > Date.now();
+const marcheSponsorisee = (a) => !!(a.sponsorisee && a.sponsoriseJusqua > Date.now());
+const montantTxt = (n) => Number(n).toLocaleString('fr-FR') + ' FCFA';
+
+async function marcheImageEcrire(id, dataUrl) {
+    imagesMarche.set(id, dataUrl);
+    if (imagesMarche.size > 100) imagesMarche.delete(imagesMarche.keys().next().value);
+    try { fs.mkdirSync(dossierImagesMarche, { recursive: true }); fs.writeFileSync(path.join(dossierImagesMarche, id + '.b64'), dataUrl); } catch (e) { /* disque indisponible */ }
+    if (upstashActif) { try { await upstash(['HSET', 'evat:marche_img', id, dataUrl]); } catch (e) { console.warn('[Marché image]', e.message); } }
+}
+async function marcheImageLire(id) {
+    if (imagesMarche.has(id)) return imagesMarche.get(id);
+    let d = null;
+    if (upstashActif) { try { d = await upstash(['HGET', 'evat:marche_img', id]); } catch (e) { /* fichier ensuite */ } }
+    if (!d) { try { d = fs.readFileSync(path.join(dossierImagesMarche, id + '.b64'), 'utf8'); } catch (e) { /* aucune */ } }
+    if (d) { imagesMarche.set(id, d); if (imagesMarche.size > 100) imagesMarche.delete(imagesMarche.keys().next().value); }
+    return d || null;
+}
+async function marcheImageSupprimer(id) {
+    imagesMarche.delete(id);
+    try { fs.unlinkSync(path.join(dossierImagesMarche, id + '.b64')); } catch (e) { /* déjà absente */ }
+    if (upstashActif) { try { await upstash(['HDEL', 'evat:marche_img', id]); } catch (e) { /* tant pis */ } }
+}
+
+function marcheVue(a, me) {
+    return { id: a.id, type: a.type, titre: a.titre, desc: a.desc, prix: a.prix, quartier: a.quartier, nom: a.nom, vendeur: a.userTel, contact: a.contact,
+             paiements: a.paiements, date: a.date, expiresAt: a.expiresAt, sponsorisee: marcheSponsorisee(a), hasImage: !!a.hasImage,
+             statut: a.userTel === me ? a.statut : undefined, mienne: a.userTel === me, signalements: a.userTel === me ? (a.signaleurs || []).length : undefined };
+}
+function marchePrevenir(tel, texte, id, statut) {
+    livrerMessagePartenaire(MARCHE_SERVICE, tel, texte);
+    io.to(roomUser(tel)).emit('marche_maj', { id: id || null, statut: statut || null });
+}
+function marchePurge() {
+    const limite = Date.now() - 30 * 86400000;
+    for (let i = marche.annonces.length - 1; i >= 0; i--) {
+        const a = marche.annonces[i];
+        if (a.expiresAt < limite || a.statut === 'supprimee') { marcheImageSupprimer(a.id); marche.annonces.splice(i, 1); }
+    }
+}
+setInterval(() => { const n = marche.annonces.length; marchePurge(); if (marche.annonces.length !== n) saveDataSoon(); }, 3600000);
+
+/** Applique le résultat d'un paiement (FedaPay ou validation manuelle de l'administrateur) */
+function marcheAppliquerPaiement(type, id, reussi) {
+    if (type === 'frais') {
+        const a = marche.annonces.find(x => x.id === id);
+        if (!a || (a.statut !== 'attente_paiement' && a.statut !== 'attente_admin')) return false;
+        if (reussi) { a.statut = 'active'; a.payeLe = Date.now(); marchePrevenir(a.userTel, '✅ Paiement reçu : votre annonce « ' + a.titre + ' » est publiée.', a.id, 'active'); }
+        else marchePrevenir(a.userTel, '❌ Le paiement des frais de publication n’a pas abouti. Vous pouvez réessayer depuis « Mes annonces ».', a.id, a.statut);
+        saveDataSoon();
+        return reussi;
+    }
+    const c = marche.commandes.find(x => x.id === id);
+    if (!c || (c.statut !== 'attente_paiement' && c.statut !== 'attente_admin')) return false;
+    if (!reussi) { marchePrevenir(c.userTel, '❌ Le paiement du forfait ' + c.nom + ' n’a pas abouti.', null, null); return false; }
+    c.statut = 'payee'; c.payeLe = Date.now();
+    const jusqua = Date.now() + c.jours * 86400000;
+    (c.annonceIds || []).forEach(aid => { const a = marche.annonces.find(x => x.id === aid && x.userTel === c.userTel); if (a) { a.sponsorisee = true; a.sponsoriseJusqua = Math.max(a.sponsoriseJusqua || 0, jusqua); } });
+    marchePrevenir(c.userTel, '✅ Forfait ' + c.nom + ' activé : vos annonces sont mises en avant pendant ' + c.jours + ' jours.', null, 'pub');
+    saveDataSoon();
+    return true;
+}
+
+/** Crée le paiement FedaPay d'une annonce (frais) ou d'une commande de publicité. Sans FedaPay : validation manuelle par l'administrateur. */
+async function marcheDemanderPaiement(me, u, type, objet, montant, libelle) {
+    if (!fedapayActif) { objet.statut = 'attente_admin'; saveDataSoon(); return { ok: true, manuel: true }; }
+    const tx = fedapayObjet(await fedapayAppel('POST', '/transactions', {
+        description: libelle.slice(0, 120), amount: montant, currency: { iso: 'XOF' }, merchant_reference: ('marche-' + objet.id).slice(0, 64),
+        custom_metadata: { interne: 'marche', type, objet: objet.id, evat_tel: me },
+        customer: { firstname: String(u.nom || 'Client').slice(0, 60), lastname: 'EVAT', phone_number: { number: me, country: 'tg' } }
+    }));
+    if (!tx.id) throw new Error('transaction sans identifiant');
+    const jeton = await fedapayAppel('POST', '/transactions/' + tx.id + '/token');
+    objet.statut = 'attente_paiement'; objet.paiementId = String(tx.id);
+    saveDataSoon();
+    return { ok: true, url: jeton.url || null, montant };
+}
+
+/* ----- Actions de l'administrateur (appelées depuis /admin) ----- */
+async function actionMarcheAdmin(action, id, b) {
+    const a = marche.annonces.find(x => x.id === id);
+    const c = marche.commandes.find(x => x.id === id);
+    if (action === 'parametres') {
+        const f = Math.round(Number(b.fraisPublication)), q = Math.round(Number(b.quotaGratuit));
+        if (!(f >= 0 && f <= 100000) || !(q >= 0 && q <= 1000)) return { ok: false, error: 'Valeurs invalides.' };
+        marche.params.fraisPublication = f; marche.params.quotaGratuit = q;
+        (Array.isArray(b.forfaits) ? b.forfaits : []).forEach(x => { const t = marche.params.forfaits.find(y => y.id === x.id); const pr = Math.round(Number(x.prix)); if (t && pr >= 0 && pr <= 1000000) t.prix = pr; });
+        saveDataSoon();
+        return { ok: true };
+    }
+    if (action === 'valider_paiement') {
+        if (a) return { ok: marcheAppliquerPaiement('frais', a.id, true) };
+        if (c) return { ok: marcheAppliquerPaiement('pub', c.id, true) };
+        return { ok: false, error: 'Introuvable.' };
+    }
+    if (action === 'refuser') {
+        if (c && (c.statut === 'attente_admin' || c.statut === 'attente_paiement')) { c.statut = 'refusee'; marchePrevenir(c.userTel, '❌ Votre commande de publicité (' + c.nom + ') n’a pas été validée.', null, null); saveDataSoon(); return { ok: true }; }
+        return { ok: false, error: 'Rien à refuser.' };
+    }
+    if (!a) return { ok: false, error: 'Annonce introuvable.' };
+    if (action === 'masquer') { a.statut = 'masquee'; marchePrevenir(a.userTel, '⚠️ Votre annonce « ' + a.titre + ' » a été retirée par l’administrateur.', a.id, 'masquee'); }
+    else if (action === 'activer') { a.statut = 'active'; a.signaleurs = []; marchePrevenir(a.userTel, '✅ Votre annonce « ' + a.titre + ' » est de nouveau visible.', a.id, 'active'); }
+    else if (action === 'supprimer') { a.statut = 'supprimee'; marchePrevenir(a.userTel, '🗑️ Votre annonce « ' + a.titre + ' » a été supprimée par l’administrateur.', a.id, 'supprimee'); marcheImageSupprimer(a.id); }
+    else return { ok: false, error: 'Action inconnue.' };
+    saveDataSoon();
+    return { ok: true };
+}
+
 /* ---------------- Socket.io ---------------- */
 const masque = t => '***' + String(t || '').slice(-3);
 const logAppel = (evt, de, vers, id, extra) =>
@@ -2075,6 +2305,160 @@ io.on('connection', (socket) => {
         ack(cb, Object.assign({ ok: true }, res));
     });
 
+    /* ----- Recherche métier sur Internet (résultats réels, aucune IA) ----- */
+    socket.on('recherche_metier', async (d, cb) => {
+        const me = socket.telephone;
+        if (!me || !d) return ack(cb, { ok: false });
+        if (!limiteur(socket, 'recherche', 15, 60000)) return ack(cb, { ok: false, error: 'Trop de recherches, patientez un instant.' });
+        const q = typeof d.q === 'string' ? d.q.replace(/\s+/g, ' ').trim().slice(0, 200) : '';
+        const type = ['web', 'images', 'videos'].includes(d.type) ? d.type : 'web';
+        const lang = typeof d.lang === 'string' ? d.lang.slice(0, 2).toLowerCase() : 'fr';
+        const pays = typeof d.pays === 'string' ? d.pays.slice(0, 2).toUpperCase() : '';
+        if (q.length < 2) return ack(cb, { ok: false, error: 'Décrivez votre besoin en quelques mots.' });
+        const source = BRAVE_KEY ? 'brave' : 'libre';
+        if (!BRAVE_KEY && type === 'videos') return ack(cb, { ok: true, type, source, resultats: [], info: 'Les vidéos demandent la clé de recherche Brave sur le serveur.' });
+        const cle = [source, type, lang, pays, q.toLowerCase()].join('|');
+        const connu = cacheRecherche.get(cle);
+        if (connu && Date.now() - connu.at < 30 * 60000) return ack(cb, { ok: true, type, source, resultats: connu.data, cache: true });
+        const jour = new Date().toISOString().slice(0, 10);
+        let qt = quotaRecherche.get(me);
+        if (!qt || qt.jour !== jour) qt = { jour, n: 0 };
+        if (qt.n >= RECH_MAX_PAR_JOUR) return ack(cb, { ok: false, error: 'Limite quotidienne de recherches atteinte. Revenez demain.' });
+        qt.n++; quotaRecherche.set(me, qt);
+        try {
+            let resultats;
+            if (BRAVE_KEY) resultats = await rechercheBrave(type, q, lang, pays);
+            else resultats = type === 'images' ? await rechercheCommons(q) : await rechercheWikipedia(q, lang);
+            cacheRecherche.set(cle, { at: Date.now(), data: resultats });
+            if (cacheRecherche.size > 500) cacheRecherche.delete(cacheRecherche.keys().next().value);
+            ack(cb, { ok: true, type, source, resultats });
+        } catch (e) {
+            qt.n = Math.max(0, qt.n - 1);
+            console.warn('[Recherche]', e.message);
+            ack(cb, { ok: false, error: e.status === 401 || e.status === 403 ? 'Le service de recherche est mal configuré (clé refusée).' : e.status === 429 ? 'Service de recherche saturé, réessayez dans un instant.' : 'Recherche indisponible pour le moment.' });
+        }
+    });
+
+    /* ----- Marché ----- */
+    socket.on('marche_lister', (d, cb) => {
+        const me = socket.telephone;
+        if (!me) return ack(cb, { ok: false });
+        if (!limiteur(socket, 'marche_l', 40, 60000)) return ack(cb, { ok: false, error: 'Trop de requêtes.' });
+        d = d || {};
+        const q = String(d.q || '').toLowerCase().trim().slice(0, 60);
+        const type = MARCHE_TYPES.includes(d.type) ? d.type : '';
+        const quartier = String(d.quartier || '').toLowerCase().trim().slice(0, 40);
+        let liste;
+        if (d.mine) liste = marche.annonces.filter(a => a.userTel === me && a.statut !== 'supprimee');
+        else liste = marche.annonces.filter(a => marcheActive(a) && (!type || a.type === type) && (!quartier || a.quartier.toLowerCase() === quartier) &&
+                                                  (!q || (a.titre + ' ' + a.desc + ' ' + a.nom).toLowerCase().includes(q)));
+        liste.sort((a, b) => (marcheSponsorisee(b) - marcheSponsorisee(a)) || (b.date - a.date));
+        ack(cb, { ok: true, annonces: liste.slice(0, 80).map(a => marcheVue(a, me)), total: liste.length,
+                  params: { fraisPublication: marche.params.fraisPublication, quotaGratuit: marche.params.quotaGratuit,
+                            gratuitesRestantes: Math.max(0, marche.params.quotaGratuit - marche.annonces.filter(a => a.userTel === me && a.gratuite).length) } });
+    });
+
+    socket.on('marche_image', async (d, cb) => {
+        if (!socket.telephone || !d) return ack(cb, { ok: false });
+        if (!limiteur(socket, 'marche_i', 120, 60000)) return ack(cb, { ok: false });
+        const id = String(d.id || '').slice(0, 24);
+        const a = marche.annonces.find(x => x.id === id);
+        if (!a || !a.hasImage || a.statut === 'supprimee') return ack(cb, { ok: false });
+        const img = await marcheImageLire(id);
+        ack(cb, img ? { ok: true, image: img } : { ok: false });
+    });
+
+    socket.on('marche_publier', async (d, cb) => {
+        const me = socket.telephone, u = me && registeredUsers.get(me);
+        if (!u || !d) return ack(cb, { ok: false, error: 'Non connecté.' });
+        if (!limiteur(socket, 'marche_pub', 6, 3600000)) return ack(cb, { ok: false, error: 'Trop de publications, réessayez plus tard.' });
+        const titre = String(d.titre || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+        const desc = String(d.desc || '').trim().slice(0, 1000);
+        const prix = String(d.prix || '').replace(/\s+/g, ' ').trim().slice(0, 40);
+        const quartier = String(d.quartier || '').replace(/\s+/g, ' ').trim().slice(0, 40) || 'Lomé';
+        const type = MARCHE_TYPES.includes(d.type) ? d.type : 'boutique';
+        const duree = MARCHE_DUREES.includes(parseInt(d.duree, 10)) ? parseInt(d.duree, 10) : 30;
+        const contact = nettoyerTel(d.contact) || me;
+        if (titre.length < 3 || desc.length < 10 || !prix) return ack(cb, { ok: false, error: 'Titre (3 lettres minimum), description (10 minimum) et prix obligatoires.' });
+        if (!telEstValide(contact)) return ack(cb, { ok: false, error: 'Numéro de contact invalide (avec l’indicatif du pays).' });
+        let image = null;
+        if (typeof d.image === 'string' && d.image) {
+            if (!/^data:image\/(jpeg|png|webp);base64,/.test(d.image.slice(0, 40)) || d.image.length > MARCHE_IMAGE_MAX) return ack(cb, { ok: false, error: 'Photo invalide ou trop lourde.' });
+            image = d.image;
+        }
+        marchePurge();
+        const miennes = marche.annonces.filter(a => a.userTel === me && a.statut !== 'supprimee');
+        if (miennes.length >= MARCHE_MAX_PAR_USER) return ack(cb, { ok: false, error: 'Vous avez atteint ' + MARCHE_MAX_PAR_USER + ' annonces : supprimez-en une avant d’en publier.' });
+        if (marche.annonces.length >= MARCHE_MAX_ANNONCES) return ack(cb, { ok: false, error: 'Le marché est complet pour le moment.' });
+        const frais = marche.params.fraisPublication;
+        const gratuitesUtilisees = marche.annonces.filter(a => a.userTel === me && a.gratuite).length;
+        const gratuite = frais <= 0 || gratuitesUtilisees < marche.params.quotaGratuit;
+        const paiements = (Array.isArray(d.paiements) ? d.paiements : []).filter(x => MARCHE_PAIEMENTS.includes(x)).slice(0, 4);
+        const a = {
+            id: crypto.randomBytes(6).toString('hex'), userTel: me, nom: String(u.nom || 'Vendeur').slice(0, 60), type, titre, desc, prix, quartier, contact,
+            paiements: paiements.length ? paiements : ['Espèces'], date: Date.now(), expiresAt: Date.now() + duree * 86400000,
+            statut: gratuite ? 'active' : 'attente_paiement', gratuite, fraisDu: gratuite ? 0 : frais, hasImage: !!image, signaleurs: []
+        };
+        marche.annonces.unshift(a);
+        if (image) await marcheImageEcrire(a.id, image);
+        saveDataSoon();
+        ack(cb, { ok: true, annonce: marcheVue(a, me), aPayer: gratuite ? 0 : frais });
+    });
+
+    socket.on('marche_payer', async (d, cb) => {
+        const me = socket.telephone, u = me && registeredUsers.get(me);
+        if (!u || !d) return ack(cb, { ok: false });
+        if (!limiteur(socket, 'marche_pay', 10, 3600000)) return ack(cb, { ok: false, error: 'Trop de tentatives.' });
+        const a = marche.annonces.find(x => x.id === String(d.id || '') && x.userTel === me);
+        if (!a || !['attente_paiement', 'attente_admin'].includes(a.statut) || !(a.fraisDu > 0)) return ack(cb, { ok: false, error: 'Rien à payer pour cette annonce.' });
+        try { ack(cb, await marcheDemanderPaiement(me, u, 'frais', a, a.fraisDu, 'Frais de publication : ' + a.titre)); }
+        catch (e) { console.warn('[Marché paiement]', e.message); ack(cb, { ok: false, error: 'Paiement indisponible pour le moment.' }); }
+    });
+
+    socket.on('marche_supprimer', async (d, cb) => {
+        const me = socket.telephone;
+        const a = me && marche.annonces.find(x => x.id === String((d && d.id) || '') && x.userTel === me);
+        if (!a) return ack(cb, { ok: false });
+        a.statut = 'supprimee';
+        marcheImageSupprimer(a.id);
+        saveDataSoon();
+        ack(cb, { ok: true });
+    });
+
+    socket.on('marche_signaler', (d, cb) => {
+        const me = socket.telephone;
+        if (!me || !d) return ack(cb, { ok: false });
+        if (!limiteur(socket, 'marche_sig', 10, 3600000)) return ack(cb, { ok: false, error: 'Trop de signalements.' });
+        const a = marche.annonces.find(x => x.id === String(d.id || ''));
+        if (!a || a.userTel === me) return ack(cb, { ok: false });
+        a.signaleurs = a.signaleurs || [];
+        if (!a.signaleurs.includes(me)) a.signaleurs.push(me);
+        if (a.signaleurs.length >= 3 && a.statut === 'active') { a.statut = 'masquee'; marchePrevenir(a.userTel, '⚠️ Votre annonce « ' + a.titre + ' » a été masquée après plusieurs signalements, en attente de vérification par l’administrateur.', a.id, 'masquee'); }
+        saveDataSoon();
+        ack(cb, { ok: true });
+    });
+
+    socket.on('marche_forfaits', (_, cb) => {
+        if (!socket.telephone) return ack(cb, { ok: false });
+        ack(cb, { ok: true, forfaits: marche.params.forfaits, paiementEnLigne: fedapayActif });
+    });
+
+    socket.on('marche_commander_pub', async (d, cb) => {
+        const me = socket.telephone, u = me && registeredUsers.get(me);
+        if (!u || !d) return ack(cb, { ok: false });
+        if (!limiteur(socket, 'marche_cmd', 6, 3600000)) return ack(cb, { ok: false, error: 'Trop de commandes, réessayez plus tard.' });
+        const f = marche.params.forfaits.find(x => x.id === String(d.forfaitId || ''));
+        if (!f) return ack(cb, { ok: false, error: 'Forfait inconnu.' });
+        const ids = [...new Set(Array.isArray(d.annonceIds) ? d.annonceIds.map(x => String(x)) : [])].slice(0, f.slots);
+        const valides = ids.filter(id => marche.annonces.some(a => a.id === id && a.userTel === me && marcheActive(a)));
+        if (!valides.length) return ack(cb, { ok: false, error: 'Choisissez au moins une de vos annonces actives.' });
+        if (f.prix <= 0) return ack(cb, { ok: false, error: 'Forfait indisponible.' });
+        const c = { id: crypto.randomBytes(6).toString('hex'), userTel: me, forfaitId: f.id, nom: f.nom, jours: f.jours, montant: f.prix, annonceIds: valides, statut: 'attente_paiement', date: Date.now() };
+        marche.commandes.push(c);
+        try { ack(cb, await marcheDemanderPaiement(me, u, 'pub', c, c.montant, 'Publicité EVAT : forfait ' + f.nom)); }
+        catch (e) { console.warn('[Marché pub]', e.message); marche.commandes.pop(); ack(cb, { ok: false, error: 'Paiement indisponible pour le moment.' }); }
+    });
+
     /* ----- Groupes légers ----- */
     socket.on('group_create', (data, cb) => {
         if (!socket.telephone) return ack(cb, { ok: false, error: 'Non connecté.' });
@@ -2504,6 +2888,21 @@ app.post('/admin/api/action', async (req, res) => {
 });
 
 
+app.get('/admin/api/marche', (req, res) => {
+    if (!controleAdmin(req, res, jetonDe(req))) return;
+    const vue = a => ({ id: a.id, vendeur: a.userTel, nom: a.nom, titre: a.titre, prix: a.prix, quartier: a.quartier, statut: a.statut, type: a.type, date: a.date, expiresAt: a.expiresAt,
+                        fraisDu: a.fraisDu || 0, signalements: (a.signaleurs || []).length, sponsorisee: marcheSponsorisee(a) });
+    res.json({ ok: true, params: marche.params, paiementEnLigne: fedapayActif,
+               annonces: marche.annonces.filter(a => a.statut !== 'supprimee').slice(0, 300).map(vue),
+               commandes: marche.commandes.slice(-100).reverse() });
+});
+app.post('/admin/api/marche/action', async (req, res) => {
+    if (!controleAdmin(req, res, jetonDe(req))) return;
+    const b = req.body || {};
+    try { res.json(await actionMarcheAdmin(String(b.action || ''), String(b.id || ''), b)); }
+    catch (e) { res.json({ ok: false, error: e.message || 'Erreur serveur' }); }
+});
+
 /* ---------------- Page de diagnostic (pour activer les services pas à pas) ---------------- */
 const diagIp = new Map();
 const esc = t => String(t).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -2664,7 +3063,7 @@ function livrerMessagePartenaire(partenaire, telDest, texte) {
     if (!dest || dest.bloque) return null;
     const texteNet = String(texte || '').trim().slice(0, 1000);
     if (!texteNet) return null;
-    const nomAffiche = '🔔 ' + partenaire.nom.charAt(0).toUpperCase() + partenaire.nom.slice(1);
+    const nomAffiche = partenaire.label || ('🔔 ' + partenaire.nom.charAt(0).toUpperCase() + partenaire.nom.slice(1));
     const msg = {
         id: Date.now().toString(36) + crypto.randomBytes(3).toString('hex'),
         from: 'svc-' + partenaire.nom, fromName: nomAffiche, to: telDest, groupId: null, groupName: null,
@@ -2765,6 +3164,13 @@ async function traiterWebhookFedapay(req, res) {
         // On relit la transaction chez FedaPay : source de vérité (statut, montant, métadonnées)
         const tx = fedapayObjet(await fedapayAppel('GET', '/transactions/' + encodeURIComponent(id)));
         const meta = tx.custom_metadata || {};
+        if (meta.interne === 'marche') {                       // paiement d'une annonce ou d'une publicité EVAT
+            const statutM = String(tx.status || '');
+            const dû = meta.type === 'frais' ? (marche.annonces.find(x => x.id === meta.objet) || {}).fraisDu : (marche.commandes.find(x => x.id === meta.objet) || {}).montant;
+            if (statutM === 'approved' && dû && parseInt(tx.amount, 10) >= dû) marcheAppliquerPaiement(meta.type === 'frais' ? 'frais' : 'pub', meta.objet, true);
+            else if (statutM === 'declined' || statutM === 'canceled') marcheAppliquerPaiement(meta.type === 'frais' ? 'frais' : 'pub', meta.objet, false);
+            return;
+        }
         const partenaire = PARTENAIRES.find(p => p.nom === meta.partenaire);
         if (!partenaire) return;
         const statut = String(tx.status || '');

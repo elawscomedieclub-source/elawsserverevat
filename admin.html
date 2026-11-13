@@ -32,6 +32,13 @@ button{border:0;border-radius:10px;padding:9px 12px;font-size:13px;color:#fff;ba
   <p class="petit" style="margin:0 0 8px">Comptes bloqués qui ont tenté de se reconnecter.</p>
   <div id="listeDemandes"></div>
 </div>
+<div class="box" id="boxMarche">
+  <h2 style="margin-top:0">🛒 Marché</h2>
+  <p class="petit" id="marcheInfo" style="margin:0 0 8px">Chargement…</p>
+  <div id="marcheParams"></div>
+  <div id="marcheAttente"></div>
+  <details style="margin-top:8px"><summary style="cursor:pointer;color:#67e8f9">Toutes les annonces</summary><div id="marcheListe"></div></details>
+</div>
 <div class="filtres">
   <button type="button" class="chip on" data-f="tous">Tous</button>
   <button type="button" class="chip" data-f="enligne">En ligne</button>
@@ -166,6 +173,43 @@ button{border:0;border-radius:10px;padding:9px 12px;font-size:13px;color:#fff;ba
     if(q && !confirm(q)) return;
     action(a, t).then(function(r){ if(!r.ok){ alert(r.error||'Échec'); return; } if(r.code) ouvrirModal('<strong>Nouveau code</strong><div id="code">'+esc(r.code)+'</div>'); charger(); }).catch(function(err){ alert(err.message); });
   });
-  charger(); setInterval(charger, 20000);
+
+  /* ---- Marché ---- */
+  function apiMarche(path, opts){ return api(path, opts); }
+  function actionMarche(a, id, extra){ return apiMarche('/admin/api/marche/action',{method:'POST',body:JSON.stringify(Object.assign({action:a,id:id||''}, extra||{}))}); }
+  var marcheDonnees = null;
+  function chargerMarche(){
+    apiMarche('/admin/api/marche').then(function(d){
+      marcheDonnees = d;
+      var att = d.annonces.filter(function(a){return a.statut==='attente_admin'||a.statut==='attente_paiement';});
+      var cmd = (d.commandes||[]).filter(function(c){return c.statut==='attente_admin'||c.statut==='attente_paiement';});
+      var sig = d.annonces.filter(function(a){return a.signalements>0 && a.statut!=='supprimee';});
+      document.getElementById('marcheInfo').textContent = d.annonces.length+' annonce(s) · '+att.length+' paiement(s) à valider · '+cmd.length+' commande(s) pub · '+sig.length+' signalée(s) · paiement en ligne : '+(d.paiementEnLigne?'actif':'non configuré (validation manuelle)');
+      var p = d.params, fo = p.forfaits.map(function(f){return '<label class="petit">'+esc(f.nom)+' (FCFA) <input type="number" min="0" data-f="'+esc(f.id)+'" value="'+f.prix+'" style="width:110px;display:inline-block;margin:0 8px 0 4px"></label>';}).join('');
+      document.getElementById('marcheParams').innerHTML = '<div class="petit" style="margin-bottom:6px"><label>Frais de publication (FCFA) <input type="number" min="0" id="mFrais" value="'+p.fraisPublication+'" style="width:110px;display:inline-block;margin:0 8px 0 4px"></label><label>Annonces gratuites par personne <input type="number" min="0" id="mQuota" value="'+p.quotaGratuit+'" style="width:80px;display:inline-block;margin:0 8px 0 4px"></label></div><div style="margin-bottom:6px">'+fo+'</div><button class="v" id="mSauver">Enregistrer les réglages</button>';
+      var lignes = att.map(function(a){ return ligneMarche(a, [['valider_paiement','✅ Valider le paiement','v'],['masquer','Retirer','d']]); }).concat(cmd.map(function(c){
+        return '<div class="u warn"><strong>Pub '+esc(c.nom)+' · '+c.montant+' FCFA</strong><small>'+esc(c.userTel)+' · '+c.annonceIds.length+' annonce(s) · '+date(c.date)+'</small><div class="btns"><button class="v" data-ma="valider_paiement" data-mi="'+esc(c.id)+'">✅ Valider</button><button class="d" data-ma="refuser" data-mi="'+esc(c.id)+'">Refuser</button></div></div>';
+      })).concat(sig.map(function(a){ return ligneMarche(a, [['activer','Rétablir','v'],['masquer','Retirer','d'],['supprimer','Supprimer','d']]); }));
+      document.getElementById('marcheAttente').innerHTML = lignes.length ? lignes.join('') : '<p class="petit">Rien à traiter.</p>';
+      document.getElementById('marcheListe').innerHTML = d.annonces.map(function(a){ return ligneMarche(a, [['masquer','Retirer','d'],['activer','Rétablir','v'],['supprimer','Supprimer','d']]); }).join('') || '<p class="petit">Aucune annonce.</p>';
+    }).catch(function(e){ document.getElementById('marcheInfo').textContent = 'Marché indisponible : '+e.message; });
+  }
+  function ligneMarche(a, btns){
+    return '<div class="u'+(a.statut!=='active'?' warn':'')+'"><strong>'+esc(a.titre)+'</strong> <small>'+esc(a.prix)+' · '+esc(a.quartier)+' · '+esc(a.nom)+' ('+esc(a.vendeur)+')</small><small>Statut : '+esc(a.statut)+(a.fraisDu?' · frais '+a.fraisDu+' FCFA':'')+(a.signalements?' · '+a.signalements+' signalement(s)':'')+(a.sponsorisee?' · ⭐ sponsorisée':'')+' · '+date(a.date)+'</small><div class="btns">'+
+      btns.map(function(b){ return '<button class="'+b[2]+'" data-ma="'+b[0]+'" data-mi="'+esc(a.id)+'">'+b[1]+'</button>'; }).join('')+'</div></div>';
+  }
+  document.getElementById('boxMarche').addEventListener('click', function(e){
+    var b = e.target.closest('button'); if(!b) return;
+    if(b.id==='mSauver'){
+      var forfaits = [].slice.call(document.querySelectorAll('#marcheParams [data-f]')).map(function(i){ return {id:i.getAttribute('data-f'), prix:Number(i.value)}; });
+      actionMarche('parametres','',{fraisPublication:Number(document.getElementById('mFrais').value), quotaGratuit:Number(document.getElementById('mQuota').value), forfaits:forfaits}).then(function(r){ alert(r.ok?'Réglages enregistrés.':(r.error||'Échec')); chargerMarche(); }).catch(function(err){ alert(err.message); });
+      return;
+    }
+    var a = b.getAttribute('data-ma'), id = b.getAttribute('data-mi'); if(!a) return;
+    var q = {supprimer:'Supprimer cette annonce définitivement ?', masquer:'Retirer cette annonce du marché ?', refuser:'Refuser cette commande ?', valider_paiement:'Confirmer que le paiement a bien été reçu ?'}[a];
+    if(q && !confirm(q)) return;
+    actionMarche(a, id).then(function(r){ if(!r.ok) alert(r.error||'Échec'); chargerMarche(); }).catch(function(err){ alert(err.message); });
+  });
+  charger(); chargerMarche(); setInterval(charger, 20000); setInterval(chargerMarche, 30000);
 })();
 </script></body></html>
