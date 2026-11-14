@@ -27,6 +27,8 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+process.on('unhandledRejection', (e) => console.error('[unhandledRejection]', (e && e.message) || e));
+process.on('uncaughtException', (e) => console.error('[uncaughtException]', (e && e.stack) || e));
 const { Server } = require('socket.io');
 const cors = require('cors');
 
@@ -1506,6 +1508,63 @@ async function actionMarcheAdmin(action, id, b) {
     return { ok: true };
 }
 
+/* ============================================================
+   DOCUMENTS DANS LES DISCUSSIONS (PDF, Word, Excel, PowerPoint, texte) — 350 Ko maximum
+   Le fichier est gardé à part pendant 7 jours (Upstash si actif, sinon fichier du serveur) ; les messages n'en portent que le nom et la taille.
+   ============================================================ */
+const DOC_TYPES = {
+    pdf: 'application/pdf', doc: 'application/msword', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    xls: 'application/vnd.ms-excel', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    ppt: 'application/vnd.ms-powerpoint', pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    txt: 'text/plain', csv: 'text/csv'
+};
+const DOC_MAX_DATAURL = 480000, DOC_DUREE = 7 * 86400000;
+const dossierDocs = path.join(DATA_DIR, 'docs');
+const docsMem = new Map();
+function docValider(d) {
+    if (!d || typeof d.data !== 'string' || typeof d.nom !== 'string') return { erreur: 'Document invalide.' };
+    if (d.data.length > DOC_MAX_DATAURL) return { erreur: 'Document trop lourd (350 Ko maximum). Réduisez-le ou envoyez un lien.' };
+    const nom = d.nom.replace(/[\u0000-\u001f\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').trim().slice(0, 80);
+    const ext = (nom.split('.').pop() || '').toLowerCase();
+    if (!DOC_TYPES[ext]) return { erreur: 'Format non accepté (PDF, Word, Excel, PowerPoint, TXT ou CSV).' };
+    const m = /^data:([\w.+\-\/]+);base64,([A-Za-z0-9+\/=]+)$/.exec(d.data);
+    if (!m) return { erreur: 'Document illisible.' };
+    const brut = Buffer.from(m[2].slice(0, 16), 'base64');
+    if (ext === 'pdf' && brut.slice(0, 4).toString('latin1') !== '%PDF') return { erreur: 'Ce fichier n’est pas un vrai PDF.' };
+    if (['docx', 'xlsx', 'pptx'].includes(ext) && brut.slice(0, 2).toString('latin1') !== 'PK') return { erreur: 'Ce fichier n’est pas un vrai document Office.' };
+    if (['doc', 'xls', 'ppt'].includes(ext) && brut.slice(0, 4).toString('hex') !== 'd0cf11e0') return { erreur: 'Ce fichier n’est pas un vrai document Office.' };
+    const taille = Math.round(m[2].length * 3 / 4);
+    return { meta: { nom, mime: DOC_TYPES[ext], taille }, data: 'data:' + DOC_TYPES[ext] + ';base64,' + m[2] };
+}
+async function docEcrire(id, dataUrl) {
+    docsMem.set(id, dataUrl);
+    if (docsMem.size > 30) docsMem.delete(docsMem.keys().next().value);
+    try { fs.mkdirSync(dossierDocs, { recursive: true }); fs.writeFileSync(path.join(dossierDocs, id + '.b64'), dataUrl); } catch (e) { /* disque indisponible */ }
+    if (upstashActif) { try { await upstash(['SET', 'evat:doc:' + id, dataUrl, 'EX', 604800]); } catch (e) { console.warn('[Doc]', e.message); } }
+}
+async function docLire(id) {
+    if (docsMem.has(id)) return docsMem.get(id);
+    let d = null;
+    if (upstashActif) { try { d = await upstash(['GET', 'evat:doc:' + id]); } catch (e) { /* fichier ensuite */ } }
+    if (!d) { try { d = fs.readFileSync(path.join(dossierDocs, id + '.b64'), 'utf8'); } catch (e) { /* aucun */ } }
+    return d || null;
+}
+function docSupprimer(id) {
+    docsMem.delete(id);
+    try { fs.unlinkSync(path.join(dossierDocs, id + '.b64')); } catch (e) { /* déjà absent */ }
+    if (upstashActif) upstash(['DEL', 'evat:doc:' + id]).catch(() => {});
+}
+setInterval(() => {
+    try { fs.readdirSync(dossierDocs).forEach(f => { const p = path.join(dossierDocs, f); if (Date.now() - fs.statSync(p).mtimeMs > DOC_DUREE) fs.unlinkSync(p); }); } catch (e) { /* dossier absent */ }
+}, 3600000);
+
+/** Destinataires d'un message (null = discussion générale, visible de tous) */
+function destinatairesMessage(m) {
+    if (m.groupId) { const g = groups.get(m.groupId); return g ? g.membres.slice() : []; }
+    if (m.to) return [m.from, m.to];
+    return null;
+}
+
 /* ---------------- Socket.io ---------------- */
 const masque = t => '***' + String(t || '').slice(-3);
 const logAppel = (evt, de, vers, id, extra) =>
@@ -1960,17 +2019,26 @@ io.on('connection', (socket) => {
         const texte = typeof payload.texte === 'string' ? payload.texte.trim().slice(0, 1000) : '';
         let image = null;
         if (typeof payload.image === 'string' && payload.image.startsWith('data:image/')) {
-            image = payload.image.slice(0, 280000);
+            if (payload.image.length > 280000) return ack(cb, { ok: false, error: 'Photo trop lourde (280 Ko maximum).' });
+            image = payload.image;
             if (image.length < 32) image = null;
         }
         let audio = null;
         if (typeof payload.audio === 'string' && payload.audio.startsWith('data:audio/')) {
             // Message vocal compressé (webm/opus ou ogg) — plafond ~350 Ko base64 (~45–60 s)
-            audio = payload.audio.slice(0, 350000);
+            if (payload.audio.length > 350000) return ack(cb, { ok: false, error: 'Message vocal trop long.' });
+            audio = payload.audio;
             if (audio.length < 32) audio = null;
         }
         const audioDur = Math.min(120, Math.max(0, parseInt(payload.audioDur, 10) || 0));
-        if (!texte && !image && !audio) return ack(cb, { ok: false, error: 'Message vide.' });
+        let doc = null, docData = null;
+        if (payload.doc) {
+            if (!limiteur(socket, 'doc', 8, 600000)) return ack(cb, { ok: false, error: 'Trop de documents envoyés, patientez quelques minutes.' });
+            const v = docValider(payload.doc);
+            if (v.erreur) return ack(cb, { ok: false, error: v.erreur });
+            doc = v.meta; docData = v.data;
+        }
+        if (!texte && !image && !audio && !doc) return ack(cb, { ok: false, error: 'Message vide.' });
 
         const me = registeredUsers.get(socket.telephone);
         if (!me) return ack(cb, { ok: false });
@@ -1998,7 +2066,8 @@ io.on('connection', (socket) => {
             to: groupId ? null : to,
             groupId: groupId || null,
             groupName: groupId && groups.get(groupId) ? groups.get(groupId).nom : null,
-            texte: texte || (audio ? '🎤 Message vocal' : (image ? '📷 Photo' : '')),
+            texte: texte || (audio ? '🎤 Message vocal' : (image ? '📷 Photo' : (doc ? '📎 ' + doc.nom : ''))),
+            doc: doc || null,
             image: image || null,
             audio: audio || null,
             audioDur: audio ? audioDur : 0,
@@ -2008,7 +2077,8 @@ io.on('connection', (socket) => {
             delivered: false, read: false
         };
 
-        const pushBody = audio ? '🎤 Message vocal' : (image ? '📷 Photo' : (texte.length > 140 ? texte.slice(0, 137) + '…' : texte));
+        if (doc) docEcrire(msg.id, docData);
+        const pushBody = audio ? '🎤 Message vocal' : (doc ? '📎 Document : ' + doc.nom : (image ? '📷 Photo' : (texte.length > 140 ? texte.slice(0, 137) + '…' : texte)));
 
         if (groupId && membresCibles) {
             let anyOnline = false;
@@ -2457,6 +2527,38 @@ io.on('connection', (socket) => {
         marche.commandes.push(c);
         try { ack(cb, await marcheDemanderPaiement(me, u, 'pub', c, c.montant, 'Publicité EVAT : forfait ' + f.nom)); }
         catch (e) { console.warn('[Marché pub]', e.message); marche.commandes.pop(); ack(cb, { ok: false, error: 'Paiement indisponible pour le moment.' }); }
+    });
+
+    /* ----- Documents : téléchargement à la demande ----- */
+    socket.on('doc_telecharger', async (d, cb) => {
+        const me = socket.telephone;
+        if (!me || !d) return ack(cb, { ok: false });
+        if (!limiteur(socket, 'doc_dl', 30, 60000)) return ack(cb, { ok: false, error: 'Trop de téléchargements, patientez.' });
+        const m = messageHistory.find(x => x.id === String(d.id || '') && x.doc);
+        if (!m) return ack(cb, { ok: false, error: 'Document expiré.' });
+        const dest = destinatairesMessage(m);
+        if (dest && !dest.includes(me)) return ack(cb, { ok: false });
+        const data = await docLire(m.id);
+        if (!data) return ack(cb, { ok: false, error: 'Document expiré (conservé 7 jours).' });
+        ack(cb, { ok: true, nom: m.doc.nom, mime: m.doc.mime, data });
+    });
+
+    /* ----- Supprimer un message pour tout le monde (expéditeur, dans les 2 heures) ----- */
+    socket.on('supprimer_message', (d, cb) => {
+        const me = socket.telephone;
+        if (!me || !d) return ack(cb, { ok: false });
+        if (!limiteur(socket, 'msg_del', 20, 60000)) return ack(cb, { ok: false });
+        const m = messageHistory.find(x => x.id === String(d.id || ''));
+        if (!m || m.from !== me || m.supprime) return ack(cb, { ok: false, error: 'Message introuvable.' });
+        if (Date.now() - m.timestamp > 2 * 3600000) return ack(cb, { ok: false, error: 'Trop tard : un message ne peut être supprimé pour tous que pendant 2 heures.' });
+        if (m.doc) docSupprimer(m.id);
+        Object.assign(m, { texte: '🚫 Message supprimé', image: null, audio: null, audioDur: 0, doc: null, reactions: undefined, supprime: true });
+        const evt = { id: m.id };
+        const dest = destinatairesMessage(m);
+        if (dest) dest.forEach(t => io.to(roomUser(t)).emit('message_supprime', evt));
+        else io.emit('message_supprime', evt);
+        saveDataSoon();
+        ack(cb, { ok: true });
     });
 
     /* ----- Groupes légers ----- */
